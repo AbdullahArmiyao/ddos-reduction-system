@@ -121,9 +121,10 @@ impl CaptureConfig {
     pub fn for_bridge(interface: &str, victim_ip: &str) -> Self {
         Self {
             interface:   interface.to_string(),
-            bpf_filter:  format!("dst host {victim_ip}"),
-            snaplen:     96,    // Ethernet(14) + IPv6(40) + TCP(20) + slack
-            timeout_ms:  10,    // 10 ms flush window (low latency)
+            // Support both standard and VLAN-tagged frames matching the victim IP
+            bpf_filter:  format!("dst host {victim_ip} or (vlan and dst host {victim_ip})"),
+            snaplen:     256,   // Capture only header bytes (optimizes memory copy speed under flood)
+            timeout_ms:  100,   // 100 ms flush window (prevents Linux TPACKET ring buffer packet drops)
             promiscuous: true,  // bridge must see all passing frames
         }
     }
@@ -133,9 +134,9 @@ impl CaptureConfig {
         Self {
             interface:   interface.to_string(),
             bpf_filter:  String::new(),
-            snaplen:     96,
+            snaplen:     256,   // Capture only header bytes (optimizes memory copy speed under flood)
             timeout_ms:  100,
-            promiscuous: false,
+            promiscuous: true,  // Enable promiscuous mode to capture bridged transit traffic
         }
     }
 }
@@ -171,7 +172,9 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
             let inactive = inactive
                 .snaplen(cfg.snaplen)
                 .timeout(cfg.timeout_ms)
-                .promisc(cfg.promiscuous);
+                .promisc(cfg.promiscuous)
+                .immediate_mode(true) // Deliver packets immediately instead of batching to prevent delay
+                .buffer_size(128 * 1024 * 1024); // 128MB buffer to prevent OS packet drops under flood
 
             match inactive.open() {
                 Ok(c) => c,
@@ -205,18 +208,42 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
         warn!("Capture: no BPF filter applied — all traffic will be processed (dev mode)");
     }
 
+    // Log the datalink type (e.g. ETHERNET, LINUX_SLL) to detect parsing issues
+    let linktype = cap.get_datalink();
+    info!("Capture: interface '{}' datalink type is {:?}", cfg.interface, linktype);
+    if linktype != pcap::Linktype::ETHERNET {
+        warn!("Capture: interface linktype is NOT Ethernet. Packet parsing will fail unless standard Ethernet headers are present.");
+    }
+
     info!("Capture: capture loop started on '{}'", cfg.interface);
 
     // -------------------------------------------------------------------------
     // Step 3: Main capture loop — runs until the channel closes or pcap errors.
     // -------------------------------------------------------------------------
     let mut packet_count: u64 = 0;
+    let mut total_raw_packets: u64 = 0;
+    let mut total_timeouts: u64 = 0;
+    let mut last_status_time = Instant::now();
 
     loop {
+        // Periodic progress status update (every 5 seconds)
+        let now = Instant::now();
+        if now.duration_since(last_status_time).as_secs() >= 5 {
+            info!(
+                "Capture: status | interface={} | raw_captured={} | timeouts={} | forwarded={}",
+                cfg.interface, total_raw_packets, total_timeouts, packet_count
+            );
+            last_status_time = now;
+        }
+
         // Retrieve the next raw frame from the pcap ring buffer.
         let raw = match cap.next_packet() {
-            Ok(p) => p,
+            Ok(p) => {
+                total_raw_packets += 1;
+                p
+            }
             Err(pcap::Error::TimeoutExpired) => {
+                total_timeouts += 1;
                 // No packets arrived within the flush window — normal during
                 // quiet periods. Loop immediately to poll again.
                 continue;
