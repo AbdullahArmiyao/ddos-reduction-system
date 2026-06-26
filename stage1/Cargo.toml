@@ -1,0 +1,39 @@
+[package]
+name    = "ddos_stage1"
+version = "0.1.0"
+edition = "2024"
+authors = ["Abdullah Armiyao <***REMOVED***>"]
+description = "Stage 1: Adaptive DDoS Pre-Filter — Packet Capture, Statistical Analysis, and Anomaly Detection"
+
+# ==============================================================================
+# Build profile optimisations
+# Release builds use maximum LTO + single codegen unit for smallest, fastest binary.
+# Debug builds keep full symbols for easy gdb/perf inspection.
+# ==============================================================================
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+panic         = "abort"   # drop unwinding runtime in production binary
+
+[profile.dev]
+opt-level = 0
+debug     = true
+
+# ==============================================================================
+# Dependencies
+# All external crates are pinned to a minimum compatible version.
+#
+#   pcap            — Rust binding to system libpcap for raw frame ingestion
+#   etherparse      — zero-copy Ethernet/IP/TCP/UDP packet header parser
+#   crossbeam-channel — bounded, lock-minimised MPSC channel between threads
+#   byteorder       — explicit endian-aware byte serialisation for the IPC struct
+#   log + env_logger — levelled logging without pulling in a heavy async runtime
+# ==============================================================================
+[dependencies]
+pcap              = "2"
+etherparse        = "0.15"
+crossbeam-channel = "0.5"
+byteorder         = "1"
+log               = "0.4"
+env_logger        = "0.11"
