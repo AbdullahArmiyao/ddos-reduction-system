@@ -22,25 +22,22 @@
 // into an explicitly sized byte buffer rather than transmuting the Rust struct
 // directly. The Python-side format string is therefore:
 //
-//   struct.unpack('<dddBQ', data)   →   8+8+8+1+8 = 33 bytes
+//   struct.unpack('<8d', data)   →   8 × 8 = 64 bytes
 //
-//   Field order on the wire (all little-endian):
-//     [0..8]   ewma_rate      f64 (8 bytes)
-//     [8..16]  entropy        f64 (8 bytes)
-//     [16..24] dominant_ip_ratio f64 (8 bytes)
-//     [24]     anomaly_flags  u8  (1 byte  — bitmask, see below)
-//     [25..33] window_id      u64 (8 bytes)
+//   Field order on the wire (all little-endian f64):
+//     [0..8]   entropy      — Shannon entropy h (bits, 0.0..5.64)
+//     [8..16]  ewma_rate    — EWMA rate snapshot r (packets/sec)
+//     [16..24] mean_h       — Welford entropy baseline
+//     [24..32] mean_r       — Welford rate baseline
+//     [32..40] sigma_h      — entropy standard deviation
+//     [40..48] sigma_r      — rate standard deviation
+//     [48..56] proto_ratio  — TCP fraction of window (0.0..1.0)
+//     [56..64] timestamp    — window close time (UNIX seconds, f64)
 //
-// ANOMALY FLAGS BITMASK
-// ----------------------
+// ANOMALY FLAGS BITMASK (retained as constants for logging; not sent on wire)
+// ---------------------------------------------------------------------------
 //   bit 0 (0x01) — EWMA rate breached upper boundary   (μ_rate + k·σ_rate)
 //   bit 1 (0x02) — Entropy dropped below lower boundary (μ_ent  − k·σ_ent)
-//
-//   Possible values:
-//     0x00 — neither metric tripped  (should not reach IPC in normal flow)
-//     0x01 — rate flood only
-//     0x02 — concentrated-source attack only
-//     0x03 — both metrics tripped simultaneously (highest confidence)
 //
 // SOCKET PATH
 // ------------
@@ -71,13 +68,16 @@ use std::{
 pub const SOCKET_PATH: &str = "/tmp/ddos_stage1.sock";
 
 /// Wire size of one serialised `FeatureVector` in bytes.
-/// Python format: `struct.unpack('<dddBQ', data)`  →  8+8+8+1+8 = 33 bytes
-pub const FEATURE_VECTOR_BYTES: usize = 33;
+/// 8 fields × 8 bytes (f64) = 64 bytes.
+/// Python format: `struct.unpack('<8d', data)`
+pub const FEATURE_VECTOR_BYTES: usize = 64;
 
 /// Anomaly flag: EWMA rate exceeded upper boundary (volume flood).
+/// Retained as a logging constant — no longer sent in the wire payload.
 pub const FLAG_RATE_ANOMALY: u8 = 0x01;
 
 /// Anomaly flag: Shannon entropy dropped below lower boundary (concentrated source).
+/// Retained as a logging constant — no longer sent in the wire payload.
 pub const FLAG_ENTROPY_ANOMALY: u8 = 0x02;
 
 // -----------------------------------------------------------------------------
@@ -86,60 +86,60 @@ pub const FLAG_ENTROPY_ANOMALY: u8 = 0x02;
 
 /// The data payload handed to Stage 2 after every anomalous window.
 ///
-/// Contains the two Layer 1 scalars (which triggered the anomaly), the
-/// ratio of the most-common source IP (useful for Stage 2 feature engineering),
-/// a bitmask describing which threshold(s) were breached, and a monotonic
-/// window counter for ordering on the Python side.
+/// Wire format: 8 × f64, little-endian, 64 bytes total.
+/// Python unpacks with: `struct.unpack('<8d', data)`
+///
+/// Field order matches the Python unpack string exactly — **do not reorder**.
 #[derive(Debug, Clone)]
 pub struct FeatureVector {
+    /// Shannon entropy of source IPs in the closed window (bits, 0.0–5.64).
+    pub entropy: f64,
     /// Current EWMA rate snapshot (packets per second).
     pub ewma_rate: f64,
-    /// Shannon entropy of source IPs in the closed window (bits).
-    pub entropy: f64,
-    /// Fraction of packets in the window coming from the single most-common IP.
-    /// Range: [1/50, 1.0].  A value near 1.0 is a strong DDoS signal.
-    pub dominant_ip_ratio: f64,
-    /// Bitmask indicating which anomaly boundary was breached.
-    /// See `FLAG_RATE_ANOMALY` / `FLAG_ENTROPY_ANOMALY`.
-    pub anomaly_flags: u8,
-    /// Monotonically increasing counter of closed windows (not just anomalous
-    /// ones) — lets Python detect gaps in the stream if frames are ever dropped.
-    pub window_id: u64,
+    /// Welford entropy baseline — mean of entropy over all past windows.
+    pub mean_h: f64,
+    /// Welford rate baseline — mean of EWMA rate over all past windows.
+    pub mean_r: f64,
+    /// Entropy standard deviation (Welford).
+    pub sigma_h: f64,
+    /// Rate standard deviation (Welford).
+    pub sigma_r: f64,
+    /// Fraction of window packets that were TCP (0.0 = all UDP/ICMP, 1.0 = all TCP).
+    pub proto_ratio: f64,
+    /// Wall-clock time of this window close (seconds since UNIX epoch).
+    pub timestamp: f64,
 }
 
 impl FeatureVector {
     /// Serialise the feature vector into a fixed-size byte buffer.
     ///
-    /// All multi-byte integers are written in **little-endian** order to match
-    /// Python's `struct.unpack('<dddBQ', data)` format string exactly.
+    /// All fields are written as **little-endian f64** to match
+    /// Python's `struct.unpack('<8d', data)` format string exactly.
     ///
     /// # Returns
-    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 33 bytes, no padding, no surprises.
+    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 64 bytes, no padding, no surprises.
     pub fn to_bytes(&self) -> [u8; FEATURE_VECTOR_BYTES] {
         let mut buf = Vec::with_capacity(FEATURE_VECTOR_BYTES);
 
-        // Field 1: ewma_rate — f64 little-endian (8 bytes, offsets 0..8)
-        buf.write_f64::<LittleEndian>(self.ewma_rate)
-            .expect("write ewma_rate to in-memory vec cannot fail");
-
-        // Field 2: entropy — f64 little-endian (8 bytes, offsets 8..16)
+        // Fields written in the exact order Python expects them.
         buf.write_f64::<LittleEndian>(self.entropy)
-            .expect("write entropy to in-memory vec cannot fail");
-
-        // Field 3: dominant_ip_ratio — f64 little-endian (8 bytes, offsets 16..24)
-        buf.write_f64::<LittleEndian>(self.dominant_ip_ratio)
-            .expect("write dominant_ip_ratio to in-memory vec cannot fail");
-
-        // Field 4: anomaly_flags — u8 (1 byte, offset 24)
-        buf.push(self.anomaly_flags);
-
-        // Field 5: window_id — u64 little-endian (8 bytes, offsets 25..33)
-        buf.write_u64::<LittleEndian>(self.window_id)
-            .expect("write window_id to in-memory vec cannot fail");
+            .expect("write entropy");
+        buf.write_f64::<LittleEndian>(self.ewma_rate)
+            .expect("write ewma_rate");
+        buf.write_f64::<LittleEndian>(self.mean_h)
+            .expect("write mean_h");
+        buf.write_f64::<LittleEndian>(self.mean_r)
+            .expect("write mean_r");
+        buf.write_f64::<LittleEndian>(self.sigma_h)
+            .expect("write sigma_h");
+        buf.write_f64::<LittleEndian>(self.sigma_r)
+            .expect("write sigma_r");
+        buf.write_f64::<LittleEndian>(self.proto_ratio)
+            .expect("write proto_ratio");
+        buf.write_f64::<LittleEndian>(self.timestamp)
+            .expect("write timestamp");
 
         debug_assert_eq!(buf.len(), FEATURE_VECTOR_BYTES, "serialisation size mismatch");
-
-        // Convert Vec into fixed-size array (infallible — sizes match).
         buf.try_into().expect("buf has exactly FEATURE_VECTOR_BYTES")
     }
 }
@@ -225,8 +225,8 @@ impl IpcSocket {
                 return false;
             }
             debug!(
-                "IPC: sent window={} flags={:#04x} rate={:.1} entropy={:.3}",
-                fv.window_id, fv.anomaly_flags, fv.ewma_rate, fv.entropy
+                "IPC: sent rate={:.1} entropy={:.3} proto_ratio={:.3} ts={:.0}",
+                fv.ewma_rate, fv.entropy, fv.proto_ratio, fv.timestamp
             );
             true
         } else {
@@ -249,49 +249,55 @@ impl Default for IpcSocket {
 mod tests {
     use super::*;
 
+    fn sample_fv() -> FeatureVector {
+        FeatureVector {
+            entropy:     4.321,
+            ewma_rate:   1234.5,
+            mean_h:      4.800,
+            mean_r:      900.0,
+            sigma_h:     0.250,
+            sigma_r:     120.0,
+            proto_ratio: 0.72,
+            timestamp:   1_700_000_000.0,
+        }
+    }
+
     /// Serialisation produces exactly FEATURE_VECTOR_BYTES bytes.
     #[test]
     fn serialised_size_is_correct() {
-        let fv = FeatureVector {
-            ewma_rate:        1234.5,
-            entropy:          4.321,
-            dominant_ip_ratio: 0.02,
-            anomaly_flags:    FLAG_RATE_ANOMALY | FLAG_ENTROPY_ANOMALY,
-            window_id:        99,
-        };
-        let bytes = fv.to_bytes();
+        let bytes = sample_fv().to_bytes();
         assert_eq!(bytes.len(), FEATURE_VECTOR_BYTES);
+        assert_eq!(FEATURE_VECTOR_BYTES, 64);
     }
 
-    /// Round-trip: serialise then manually re-parse with byteorder.
+    /// Round-trip: serialise then re-parse with byteorder.
     /// This is the byte-alignment sanity check — same logic Python uses.
     #[test]
     fn round_trip_byte_layout() {
         use byteorder::{LittleEndian, ReadBytesExt};
         use std::io::Cursor;
 
-        let fv = FeatureVector {
-            ewma_rate:         500.0,
-            entropy:           3.14159,
-            dominant_ip_ratio: 0.5,
-            anomaly_flags:     FLAG_ENTROPY_ANOMALY,
-            window_id:         42,
-        };
-
+        let fv    = sample_fv();
         let bytes = fv.to_bytes();
-        let mut cursor = Cursor::new(bytes);
+        let mut cur = Cursor::new(bytes);
 
-        let ewma  = cursor.read_f64::<LittleEndian>().unwrap();
-        let ent   = cursor.read_f64::<LittleEndian>().unwrap();
-        let ratio = cursor.read_f64::<LittleEndian>().unwrap();
-        let flags = cursor.read_u8().unwrap();
-        let wid   = cursor.read_u64::<LittleEndian>().unwrap();
+        let entropy     = cur.read_f64::<LittleEndian>().unwrap();
+        let ewma_rate   = cur.read_f64::<LittleEndian>().unwrap();
+        let mean_h      = cur.read_f64::<LittleEndian>().unwrap();
+        let mean_r      = cur.read_f64::<LittleEndian>().unwrap();
+        let sigma_h     = cur.read_f64::<LittleEndian>().unwrap();
+        let sigma_r     = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_ratio = cur.read_f64::<LittleEndian>().unwrap();
+        let timestamp   = cur.read_f64::<LittleEndian>().unwrap();
 
-        assert!((ewma  - 500.0  ).abs() < 1e-9);
-        assert!((ent   - 3.14159).abs() < 1e-9);
-        assert!((ratio - 0.5    ).abs() < 1e-9);
-        assert_eq!(flags, FLAG_ENTROPY_ANOMALY);
-        assert_eq!(wid, 42);
+        assert!((entropy     - 4.321           ).abs() < 1e-9);
+        assert!((ewma_rate   - 1234.5          ).abs() < 1e-9);
+        assert!((mean_h      - 4.800           ).abs() < 1e-9);
+        assert!((mean_r      - 900.0           ).abs() < 1e-9);
+        assert!((sigma_h     - 0.250           ).abs() < 1e-9);
+        assert!((sigma_r     - 120.0           ).abs() < 1e-9);
+        assert!((proto_ratio - 0.72            ).abs() < 1e-9);
+        assert!((timestamp   - 1_700_000_000.0 ).abs() < 1e-3);
     }
 
     /// FLAG constants must not overlap.

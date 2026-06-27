@@ -287,7 +287,7 @@ DDoS Reduction Project/
 ### Linux (Debian/Ubuntu, RHEL/Fedora, Alpine)
 
 ```bash
-sudo bash scripts/install.sh --interface br0 --victim-ip 10.0.0.3
+sudo bash scripts/install.sh --interface ens19 --victim-ip 10.0.0.3
 ```
 
 This will:
@@ -312,7 +312,7 @@ install.bat
 
 ```bash
 # Production (on sensor VM)
-sudo ddos_stage1 --interface br0 --victim-ip 10.0.0.3
+sudo ddos_stage1 --interface ens19 --victim-ip 10.0.0.3
 
 # Development (no BPF filter, any interface)
 RUST_LOG=debug sudo ddos_stage1 --interface lo --no-filter

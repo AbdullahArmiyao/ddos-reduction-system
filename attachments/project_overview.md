@@ -21,10 +21,30 @@ scripts/
 └── uninstall.sh            ← Full teardown: service + binary + socket
 ```
 
+## The Routed Subnet Setup (192.168.1.0/24 $\rightarrow$ 10.0.0.0/24)
+
+To ensure the Sensor VM can inspect and filter all traffic, the Attacker and Victim are separated into two distinct subnets connected by the Sensor VM acting as an IP Router:
+
+```
+[ Attacker / Flash Crowd ]             [ Sensor VM / Gateway ]                 [ Victim VM ]
+  (Subnet: 192.168.1.0/24)             (Router/Firewall Gateway)          (Subnet: 10.0.0.0/24)
+  (IP: 192.168.1.4)                                │                      (IP: 10.0.0.3)
+         │                                         │                            │
+     [ vmbr1 ] <───────────────────────────────> [ens19]                        │
+   (LAN Segment 1)                       (IP: 192.168.1.2)                      │
+                                                 [ens20] <──────────────────> [ vmbr2 ]
+                                         (IP: 10.0.0.2)                     (LAN Segment 2)
+```
+
+*   **How it works:** The Attacker VM (`192.168.1.4`) targets the Victim VM (`10.0.0.3`). Because they are on different subnets, the Attacker routes the traffic through its default gateway (`192.168.1.2` - the Sensor VM's ingress interface `ens19`).
+*   **Where to capture:** Run `ddos_stage1` on the **ingress interface (`ens19`)** where the flood traffic first enters the gateway.
+
+---
+
 ## The Three-Layer Pipeline (Stage 1)
 
 ```
-[ Stage 0: pcap captures br0 frame ]
+[ Stage 0: pcap captures ingress frame ]
            │ (BPF: dst host <victim_ip>)
            │ PacketMeta { src_ip, arrived_at }
            ▼ crossbeam bounded channel
@@ -65,7 +85,8 @@ scripts/
 ## Run Command (on gateway)
 
 ```bash
-sudo ./ddos_stage1 --interface br0 --victim-ip 10.0.0.3
+# Listen on ingress interface ens19 targeting the victim IP
+sudo ./ddos_stage1 --interface ens19 --victim-ip 10.0.0.3
 ```
 
 Or via systemd after `install.sh`:

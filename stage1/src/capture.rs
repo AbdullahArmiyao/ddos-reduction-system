@@ -51,7 +51,7 @@
 // =============================================================================
 
 use crossbeam_channel::Sender;
-use etherparse::{SlicedPacket, InternetSlice};
+use etherparse::{SlicedPacket, InternetSlice, TransportSlice};
 use log::{debug, error, info, warn};
 use pcap::{Capture, Device};
 use std::{net::IpAddr, time::Instant};
@@ -71,6 +71,21 @@ pub const CHANNEL_CAPACITY: usize = 1024;
 // PacketMeta — the minimal per-packet record passed across the channel
 // -----------------------------------------------------------------------------
 
+/// Layer 4 protocol discriminant extracted from the IP header.
+///
+/// Only the three protocol types relevant to volumetric DDoS floods are
+/// tracked explicitly. Everything else is folded into `Other` so the
+/// capture loop stays branchless on normal traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    /// ICMP (IPv4) or ICMPv6.
+    Icmp,
+    /// Any other IP protocol number (ESP, GRE, SCTP, …).
+    Other,
+}
+
 /// Lightweight per-packet metadata record sent from the capture thread to
 /// the analysis thread via the crossbeam channel.
 ///
@@ -84,6 +99,8 @@ pub struct PacketMeta {
     /// High-resolution monotonic timestamp recorded *immediately* after pcap
     /// delivers the frame to user space. Used by EWMA for inter-arrival timing.
     pub arrived_at: Instant,
+    /// Layer 4 protocol — used by the analysis thread to build proto_ratio.
+    pub protocol: Protocol,
 }
 
 // -----------------------------------------------------------------------------
@@ -285,12 +302,25 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
             _ => continue,
         };
 
+        // -------------------------------------------------------------------------
+        // Step 5b: Identify the Layer 4 protocol from the transport header.
+        // etherparse already parsed the transport slice alongside the IP header,
+        // so this match is zero-cost — no extra parsing needed.
+        // -------------------------------------------------------------------------
+        let protocol = match sliced.transport {
+            Some(TransportSlice::Tcp(_))          => Protocol::Tcp,
+            Some(TransportSlice::Udp(_))          => Protocol::Udp,
+            Some(TransportSlice::Icmpv4(_))       => Protocol::Icmp,
+            Some(TransportSlice::Icmpv6(_))       => Protocol::Icmp,
+            _                                     => Protocol::Other,
+        };
+
         packet_count += 1;
 
         // -------------------------------------------------------------------------
         // Step 6: Forward metadata to the analysis thread via the bounded channel.
         // -------------------------------------------------------------------------
-        let meta = PacketMeta { src_ip, arrived_at };
+        let meta = PacketMeta { src_ip, arrived_at, protocol };
 
         // `send()` blocks if the channel is full (backpressure).  This is the
         // correct behaviour — it prevents unbounded memory growth under flood.

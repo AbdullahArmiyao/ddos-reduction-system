@@ -1,0 +1,335 @@
+Smart constraint for a lab environment. A few things that implies for your system:
+
+---
+
+## What It Affects
+
+**Your baseline will reflect that limit.** When you collect normal traffic, the Nginx victim will never serve more than 255 concurrent HTTP connections. That ceiling becomes part of what Welford learns as "normal." Your `mean_r` and `mean_h` baselines will be calibrated to traffic that never exceeds that threshold.
+
+**Your HTTP flood test needs to respect the lab reality.** When you run an HTTP GET flood with `ab`, you're not trying to overwhelm a production server — you're trying to push traffic patterns that look statistically different from baseline. Even within a 255-connection limit, a flood will still cause EWMA to spike and entropy to behave differently from normal browsing patterns.
+
+**Your `proto_ratio` will be TCP-heavy.** HTTP runs over TCP, so under normal lab conditions your protocol distribution will be predominantly TCP. This is actually useful — a UDP flood will shift `proto_ratio` dramatically away from that baseline, making it a strong discriminating feature for that attack type.
+
+---
+
+## One Thing to Verify
+
+Make sure your Attacker LXC can generate enough traffic to actually trigger your Welford thresholds given that 255-connection ceiling on the victim side. If the victim throttles connections before Stage 1 sees enough anomalous packets to close a window, your detection latency numbers won't reflect reality.
+
+For SYN floods this isn't an issue — SYN packets don't complete the handshake so the 255 limit doesn't throttle them. For HTTP GET floods it matters more.
+
+Does that match your testing plan?
+
+You've already built and run Stage 1. Let me read these carefully.You've already built and run Stage 1. This is significant. Let me give you a full read of what these logs are telling you.
+
+---
+
+## Screenshot 1 — Warm-up Phase Working Correctly
+
+You can see windows 20/30, 29/30, and then window 30 hitting `NORMAL`. This is the Welford warm-up period — your system is collecting baseline windows before it starts making anomaly decisions. By window 30 it has enough samples to compute a meaningful `μ + 2σ` boundary. `r=6700.5 pps`, `h=1.0000 bits` at that point — clean baseline established.
+
+---
+
+## Screenshot 2 — Stable Normal Operation
+
+All windows classifying as `NORMAL`. Rate bouncing between ~1.3M and ~1.5M pps, entropy `h=0.0000` consistently. `σ_r` around 2,005,000 — your Welford baseline is stable and tracking correctly. The system is running and healthy.
+
+---
+
+## Screenshot 3 — Two Issues Worth Addressing
+
+**Issue 1 — `etherparse failed on packet #XXXXXXX: skipping`**
+
+This is the significant one. You are dropping a large number of packets because `etherparse` can't parse them. This happens when packets arrive that aren't standard Ethernet/IPv4/TCP or UDP frames — things like ARP packets, IPv6 frames, VLAN-tagged frames, or malformed packets. Your capture filter isn't excluding them so they hit `etherparse` and get skipped.
+
+This is not catastrophic — your system keeps running — but it means your window counts are based on successfully parsed packets only, and a high skip rate means your 50-packet windows are taking longer to close than expected. Worth fixing with a tighter BPF filter.
+
+**Issue 2 — Windows still classifying NORMAL during what looks like a flood**
+
+Window 25624 shows `r=12201.2 pps` and `h=1.0000` — still NORMAL. Window 25625 shows `r=6540.7` — also NORMAL. Your Welford baseline has adapted to high rates, which means either this is genuinely normal traffic for your lab or your warm-up period saw high rates and incorporated them into the baseline.
+
+---
+
+## Screenshot 4 — Extremely High Window Numbers
+
+You're at window 26,153 through 26,176 — all classifying NORMAL. Rate fluctuating wildly between ~243K and ~957K pps. Entropy `h` values between 0.14 and 1.0. `σ_h` stabilising around 0.71.
+
+The most important thing here: **your system has been running long enough to see 26,000+ windows**. That's over 1.3 million packets processed. Stage 1 is stable, persistent, and producing consistent output.
+
+---
+
+## Three Action Items From These Logs
+
+**1. Fix the etherparse skip rate** — add a BPF filter to exclude non-IPv4 traffic:
+```
+dst host <victim_ip> and ip
+```
+The `and ip` clause tells `pcap` to only hand you IPv4 frames, so `etherparse` never sees ARP or IPv6 packets it can't handle.
+
+**2. Check your warm-up window count** — 30 windows may be too few if your baseline traffic already includes high-rate bursts. Consider increasing to 50 or 100 warm-up windows so Welford has a more stable baseline before it starts making anomaly decisions.
+
+**3. You are ready to collect training data** — Stage 1 is running and producing feature vectors. This means you can now start Phase A of your training pipeline — capturing normal traffic labels — immediately.
+
+Stage 1 is working. Good work.
+Excellent. That context changes the read significantly. Let me go through each one.
+
+---
+
+## Image 1 — Normal ICMP Pings (Warm-up)
+
+This is correct behaviour. Low rate, `h=1.0000` consistently — two source IPs pinging means near-maximum entropy for a small window, which is exactly right. Welford is building a baseline from genuinely calm traffic. Warm-up completing at window 30 on ping traffic is fine.
+
+---
+
+## Image 2 — hping3 (SYN/UDP Flood)
+
+**This is a problem.** Everything is still classifying as `NORMAL` despite hping3 running. Look at the rates — 1.3M to 1.5M pps. That is an enormous rate. But your Welford baseline trained on pings is showing `σ_r` around 2,000,000 — meaning your standard deviation is so large that even 1.5M pps doesn't breach `μ + 2σ`.
+
+The root cause: **your warm-up baseline was trained on ping traffic, then hping3 immediately dominated the rate so aggressively that Welford adapted its baseline upward to include the flood rates.** By the time the flood was running, `μ_r` had already incorporated the high rates as "normal."
+
+Also notice `h=0.0000` throughout — entropy is zero, meaning all packets are coming from a single source IP. That should be triggering your entropy check (`h < mean_h - 2*sigma_h`). The fact that it isn't suggests your entropy Welford baseline also adapted — or your anomaly check direction needs verifying.
+
+---
+
+## Image 3 — Locust (HTTP Load)
+
+The `etherparse` skip storm starts here. Locust generates HTTP traffic which involves TCP handshakes, HTTP headers, and response traffic — some of which may be non-standard frames or response packets that don't match your inbound filter cleanly. The windows that do close (`h=0.3274`, `h=0.9710`) show variable entropy — Locust is using multiple workers so source IP diversity is real. Still classifying NORMAL.
+
+---
+
+## Image 4 — Slowloris
+
+This is the most interesting one. Slowloris is a low-and-slow attack — it opens many HTTP connections and sends partial headers very slowly, holding connections open without completing requests. Look at what your system sees: rates fluctuating wildly between 243K and 957K pps, entropy between 0.14 and 1.0, all still NORMAL.
+
+Slowloris is the classic case your system was designed to struggle with — it's out of your stated scope (Layer 7 attack) and your features don't reliably catch it. The fact that it classifies NORMAL is actually expected and honest.
+
+---
+
+## The Core Problem Across All Four
+
+Your warm-up baseline is the issue. Training Welford on two pings then immediately throwing a flood at it means Welford never got a stable low-rate baseline. By the time hping3 hit, the mean and sigma had already shifted upward.
+
+**The fix before you collect training data:**
+
+Run your warm-up on realistic normal traffic — not just pings. HTTP browsing to the Nginx victim, some background noise, varied source IPs. Run it for longer — 200 to 500 windows minimum before you start any attack. That gives Welford a baseline that genuinely represents normal, so attack traffic actually breaches the boundary.
+
+---
+
+## What This Means for Training Data Collection
+
+Right now your labelled data would have:
+- Normal traffic labelled `0` — but with a corrupted baseline
+- Attack traffic labelled `1` — but classifying as NORMAL because the baseline adapted
+
+Your RF would train on misleading feature vectors. Fix the warm-up first, then collect training data.
+
+**Revised sequence:**
+1. Fix BPF filter to exclude non-IPv4 frames
+2. Run proper warm-up — 300+ windows of realistic HTTP + mixed traffic
+3. Collect normal traffic feature vectors — label `0`
+4. Run each attack type separately — label `1`
+5. Train RF on clean labelled data
+
+Does that match what you were suspecting?
+Good constraint to nail down now. Let me think through this with you.
+
+---
+
+## What You Have
+
+```
+Attacker LXC     → hping3, SYN/UDP/ICMP floods
+Locust LXC       → HTTP load generation
+Victim LXC       → Nginx target
+Gateway VM       → Rust sensor, br0, Stage 1 running
+```
+
+---
+
+## The Problem
+
+For warm-up you need **realistic normal traffic** — varied source IPs, moderate rates, mixed protocols. With only one attacker and one Locust node, your normal traffic options are limited.
+
+---
+
+## The Solution — Use What You Have Creatively
+
+**Normal traffic generation without extra VMs:**
+
+**Option 1 — Locust at low concurrency**
+Locust is already an HTTP load generator. Run it at very low worker count — 2 to 5 users, slow spawn rate, random wait times between requests. This produces realistic HTTP traffic from one source IP at a gentle rate. It's not diverse in source IPs but it's realistic in protocol behaviour.
+
+**Option 2 — curl loops from the attacker LXC**
+The attacker LXC doesn't have to attack. During warm-up, run simple `curl` loops to the Nginx victim:
+```bash
+while true; do curl -s http://<victim_ip>/ > /dev/null; sleep 0.5; done
+```
+This generates legitimate HTTP GET requests at a human-like rate from a second source IP — giving you two source IPs and decent entropy.
+
+**Option 3 — ping + curl simultaneously**
+Run pings from the attacker AND curl loops from the Locust LXC simultaneously during warm-up. Two source IPs, two protocols, moderate rate. This is your most realistic normal baseline given your constraints.
+
+**Option 4 — Gateway generates its own traffic**
+From the gateway VM itself, run curl requests to the victim through `br0`. Since the gateway is inline, this traffic passes through the bridge and gets captured by pcap. One more source IP added to the mix.
+
+---
+
+## Recommended Warm-up Strategy
+
+Run all three simultaneously for 300+ windows before touching hping3:
+
+```
+Attacker LXC  → curl loop to victim (slow, ~1 req/sec)
+Locust LXC    → 3-5 Locust users hitting Nginx gently
+Gateway VM    → occasional curl requests to victim
+```
+
+This gives you:
+- 3 distinct source IPs → decent entropy baseline
+- Mixed TCP traffic → realistic `proto_ratio` baseline
+- Low-moderate rate → realistic `mean_r` baseline that flood traffic will genuinely breach
+
+---
+
+## One Important Note on Your Entropy Baseline
+
+With only 3 or 4 source IPs during normal traffic, your entropy values will be moderate — not close to 1.0. That's fine. What matters is that your Welford baseline reflects that moderate entropy as normal, so when a single-source SYN flood drops entropy to 0.0, it genuinely breaches `mean_h - 2*sigma_h`.
+
+The problem in your earlier logs was entropy staying at `h=1.0000` during warm-up (only 2 pings) then `h=0.0000` during hping3 — but the sigma was so small from the stable warm-up that paradoxically it may or may not have triggered. With a more varied warm-up, your sigma will be more realistic.
+
+---
+
+## For Training Data Collection Specifically
+
+Once warm-up is solid, your labelled data collection plan is:
+
+| Phase | What runs | Label | Duration |
+|---|---|---|---|
+| Normal | curl + Locust low concurrency | 0 | 500+ windows |
+| SYN flood | hping3 -S | 1 | 200+ windows |
+| UDP flood | hping3 --udp | 1 | 200+ windows |
+| ICMP flood | hping3 --icmp | 1 | 200+ windows |
+| HTTP flood | Locust high concurrency | 1 | 200+ windows |
+| Mixed normal + low attack | curl + gentle Locust | 0 | 200+ windows |
+
+That last row is important — it teaches the RF what a flash crowd looks like so it doesn't confuse legitimate surges with attacks.
+
+Does that work within your lab constraints?
+
+Good. Let me map that against what your system actually needs.
+
+---
+
+## Resource Reality Check
+
+```
+Gateway VM    → 4GB RAM, 4 cores  ← your most important node, well provisioned
+Attacker LXC  → 2GB RAM, 2 cores  ← enough for hping3 and curl simultaneously
+Locust LXC    → 1GB RAM, 1 core   ← tight but workable for low concurrency
+Victim LXC    → 1GB RAM, 1 core   ← Nginx at 255 connections, fine
+```
+
+Total assigned: 8GB. Proxmox itself needs roughly 2GB comfortably. You have 16GB — that leaves 6GB headroom. You're not tight at all.
+
+---
+
+## The One Constraint That Matters
+
+**Locust at 1GB RAM, 1 core.**
+
+Locust is Python-based and memory-hungry at high concurrency. At 255 connection limit on the victim anyway, you'll never need high concurrency. Keep Locust at 10-20 users maximum during normal traffic generation and 50-100 users for HTTP flood testing. At those numbers 1GB is sufficient.
+
+---
+
+## What This Means for Your Warm-up Strategy
+
+Your gateway has 4 cores — that's important. Your Stage 1 architecture uses:
+
+- Core 1 → capture thread (`pcap`)
+- Core 2 → analysis thread (Welford/EWMA/entropy)
+- Core 3 → available for Stage 2 Python process later
+- Core 4 → OS overhead, logging, socket handling
+
+That's a clean fit. You won't be resource-constrained during flood testing on the gateway side.
+
+---
+
+## Revised Warm-up Plan For Your Exact Lab
+
+Run these simultaneously for 300+ windows:
+
+```
+Attacker LXC  → curl loop, 1 req/sec to victim       (1 source IP, TCP)
+Locust LXC    → 5 users, 1-2 req/sec each to victim  (1 source IP, TCP)
+Victim LXC    → just serving, no action needed
+Gateway VM    → occasional curl to victim             (1 source IP, TCP)
+```
+
+Three source IPs, all TCP, low rate. Realistic and achievable within your constraints.
+
+---
+
+## One Honest Limitation
+
+With only 3-4 source IPs during normal traffic, your entropy baseline will sit around 1.5-2.0 bits rather than a high value. That's fine — what matters is consistency. Your Welford mean and sigma will reflect that range, and a single-source flood dropping to 0.0 bits will breach the boundary clearly.
+
+---
+
+## Training Data Collection Schedule
+
+Given your hardware, this is realistic in one sitting:
+
+| Phase | Tool | Duration | Expected Windows |
+|---|---|---|---|
+| Warm-up | curl + Locust 5 users | ~10 min | 300 windows |
+| Normal baseline | curl + Locust 5 users | ~20 min | 500 windows |
+| SYN flood | hping3 -S --flood | ~5 min | 200 windows |
+| UDP flood | hping3 --udp --flood | ~5 min | 200 windows |
+| ICMP flood | hping3 --icmp --flood | ~5 min | 200 windows |
+| HTTP flood | Locust 100 users | ~5 min | 200 windows |
+| Flash crowd sim | Locust 30 users burst | ~5 min | 150 windows |
+
+Total: roughly one hour of controlled traffic generation gives you a clean labelled dataset across all attack types plus normal and flash crowd cases.
+
+Your hardware can sustain that comfortably. The gateway's 4GB RAM means Stage 1 will not be memory-pressured even during a heavy hping3 flood.
+
+Ready to move forward?
+
+Yes. Exactly right.
+
+The order is non-negotiable:
+
+```
+Stage 1 working correctly
+        ↓
+Warm-up baseline solid
+        ↓
+Clean labelled training data collected
+        ↓
+RF trained on that data
+        ↓
+Stage 2 built and connected
+```
+
+You cannot train the RF without clean labelled feature vectors. You cannot get clean labelled feature vectors without a solid warm-up baseline. You cannot get a solid warm-up baseline without fixing the two issues we identified — the BPF filter and the warm-up traffic strategy.
+
+---
+
+## What To Fix Right Now In Stage 1
+
+**Fix 1 — BPF filter:**
+Add `and ip` to your capture filter to stop `etherparse` choking on non-IPv4 frames. That clears the skip storm you saw in image 3.
+
+**Fix 2 — Warm-up traffic:**
+Replace the two-ping warm-up with the curl + Locust low-concurrency strategy we just mapped out. 300 windows minimum before any attack traffic runs.
+
+**Fix 3 — Warm-up window count:**
+Consider increasing your warm-up period from 30 windows to at least 100. 30 windows on ping traffic is too thin a baseline for Welford to produce meaningful `σ` values.
+
+---
+
+## The Good News
+
+Stage 1 is already running and producing output. These are configuration and tuning fixes — not architectural changes. Once those three things are sorted, you collect training data, train the RF, and Stage 2 follows naturally.
+
+Sort Stage 1 first. Stage 2 will wait.

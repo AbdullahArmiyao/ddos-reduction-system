@@ -54,7 +54,7 @@
 // =============================================================================
 
 use crate::{
-    capture::PacketMeta,
+    capture::{PacketMeta, Protocol},
     entropy::EntropyAccumulator,
     ewma::EwmaState,
     ipc::{FeatureVector, IpcSocket, FLAG_ENTROPY_ANOMALY, FLAG_RATE_ANOMALY},
@@ -64,6 +64,7 @@ use crossbeam_channel::Receiver;
 use log::{info, warn};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // -----------------------------------------------------------------------------
 // AnalysisConfig
@@ -121,6 +122,11 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     let mut ewma    = EwmaState::with_alpha(cfg.ewma_alpha);
     let mut entropy = EntropyAccumulator::new();
 
+    // Layer 1 protocol counters — cleared on every window boundary.
+    let mut tcp_count:  u32 = 0;
+    let mut udp_count:  u32 = 0;
+    let mut icmp_count: u32 = 0;
+
     // Layer 3 state — two independent Welford accumulators (never shared).
     let mut welford_rate    = WelfordAccumulator::default(); // tracks r (pps)
     let mut welford_entropy = WelfordAccumulator::default(); // tracks h (bits)
@@ -157,6 +163,14 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         *ip_counts.entry(meta.src_ip).or_insert(0) += 1;
         window_packet_count += 1;
 
+        // Increment the Layer 4 protocol counter for the current window.
+        match meta.protocol {
+            Protocol::Tcp  => tcp_count  += 1,
+            Protocol::Udp  => udp_count  += 1,
+            Protocol::Icmp => icmp_count += 1,
+            Protocol::Other => {} // not tracked in the ratio
+        }
+
         // =====================================================================
         // LAYER 2 — Window Close (every WINDOW_SIZE packets)
         // =====================================================================
@@ -179,9 +193,28 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         let dominant_count = ip_counts.values().copied().max().unwrap_or(0);
         let dominant_ip_ratio = dominant_count as f64 / window_packet_count as f64;
 
-        // Reset the temporary per-window IP map for the next window.
+        // Compute proto_ratio: fraction of window packets that were TCP.
+        // Range [0.0, 1.0] — a UDP/ICMP flood will push this toward 0.0.
+        let total_tracked = (tcp_count + udp_count + icmp_count) as f64;
+        let proto_ratio = if total_tracked > 0.0 {
+            tcp_count as f64 / total_tracked
+        } else {
+            0.0
+        };
+
+        // Wall-clock timestamp of this window close (seconds since UNIX epoch).
+        // Used by Stage 2 for time-based analysis and logging.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        // Reset all per-window accumulators for the next window.
         ip_counts.clear();
         window_packet_count = 0;
+        tcp_count  = 0;
+        udp_count  = 0;
+        icmp_count = 0;
 
         // =====================================================================
         // LAYER 3 — Welford Update and Anomaly Evaluation
@@ -234,16 +267,20 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         if anomaly_flags != 0 {
             warn!(
                 "ANOMALY window {} | flags={:#04x} | r={:.1} (boundary={:.1}) | \
-                 h={:.4} (boundary={:.4}) | dom_ratio={:.3}",
-                window_id, anomaly_flags, r, rate_boundary, h, entropy_boundary, dominant_ip_ratio
+                 h={:.4} (boundary={:.4}) | proto_ratio={:.3} | dom_ratio={:.3}",
+                window_id, anomaly_flags, r, rate_boundary, h, entropy_boundary,
+                proto_ratio, dominant_ip_ratio
             );
 
             let fv = FeatureVector {
-                ewma_rate: r,
-                entropy: h,
-                dominant_ip_ratio,
-                anomaly_flags,
-                window_id,
+                entropy:     h,
+                ewma_rate:   r,
+                mean_h:      welford_entropy.mean,
+                mean_r:      welford_rate.mean,
+                sigma_h:     welford_entropy.std_dev(),
+                sigma_r:     welford_rate.std_dev(),
+                proto_ratio,
+                timestamp,
             };
 
             // Attempt to send to Stage 2. If the socket is not connected yet
