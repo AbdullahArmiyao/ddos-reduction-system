@@ -278,6 +278,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 sigma_h:     welford_entropy.std_dev(),
                 sigma_r:     welford_rate.std_dev(),
                 proto_ratio,
+                dominant_ip_ratio,
                 timestamp,
             };
 

@@ -68,9 +68,9 @@ use std::{
 pub const SOCKET_PATH: &str = "/tmp/ddos_stage1.sock";
 
 /// Wire size of one serialised `FeatureVector` in bytes.
-/// 8 fields × 8 bytes (f64) = 64 bytes.
-/// Python format: `struct.unpack('<8d', data)`
-pub const FEATURE_VECTOR_BYTES: usize = 64;
+/// 9 fields × 8 bytes (f64) = 72 bytes.
+/// Python format: `struct.unpack('<9d', data)`
+pub const FEATURE_VECTOR_BYTES: usize = 72;
 
 /// Anomaly flag: EWMA rate exceeded upper boundary (volume flood).
 /// Retained as a logging constant — no longer sent in the wire payload.
@@ -86,8 +86,8 @@ pub const FLAG_ENTROPY_ANOMALY: u8 = 0x02;
 
 /// The data payload handed to Stage 2 after every anomalous window.
 ///
-/// Wire format: 8 × f64, little-endian, 64 bytes total.
-/// Python unpacks with: `struct.unpack('<8d', data)`
+/// Wire format: 9 × f64, little-endian, 72 bytes total.
+/// Python unpacks with: `struct.unpack('<9d', data)`
 ///
 /// Field order matches the Python unpack string exactly — **do not reorder**.
 #[derive(Debug, Clone)]
@@ -106,6 +106,8 @@ pub struct FeatureVector {
     pub sigma_r: f64,
     /// Fraction of window packets that were TCP (0.0 = all UDP/ICMP, 1.0 = all TCP).
     pub proto_ratio: f64,
+    /// Fraction of packets from the busiest IP.
+    pub dominant_ip_ratio: f64,
     /// Wall-clock time of this window close (seconds since UNIX epoch).
     pub timestamp: f64,
 }
@@ -114,10 +116,10 @@ impl FeatureVector {
     /// Serialise the feature vector into a fixed-size byte buffer.
     ///
     /// All fields are written as **little-endian f64** to match
-    /// Python's `struct.unpack('<8d', data)` format string exactly.
+    /// Python's `struct.unpack('<9d', data)` format string exactly.
     ///
     /// # Returns
-    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 64 bytes, no padding, no surprises.
+    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 72 bytes, no padding, no surprises.
     pub fn to_bytes(&self) -> [u8; FEATURE_VECTOR_BYTES] {
         let mut buf = Vec::with_capacity(FEATURE_VECTOR_BYTES);
 
@@ -136,6 +138,8 @@ impl FeatureVector {
             .expect("write sigma_r");
         buf.write_f64::<LittleEndian>(self.proto_ratio)
             .expect("write proto_ratio");
+        buf.write_f64::<LittleEndian>(self.dominant_ip_ratio)
+            .expect("write dom_ratio");
         buf.write_f64::<LittleEndian>(self.timestamp)
             .expect("write timestamp");
 
@@ -258,6 +262,7 @@ mod tests {
             sigma_h:     0.250,
             sigma_r:     120.0,
             proto_ratio: 0.72,
+            dominant_ip_ratio: 0.66,
             timestamp:   1_700_000_000.0,
         }
     }
@@ -267,7 +272,7 @@ mod tests {
     fn serialised_size_is_correct() {
         let bytes = sample_fv().to_bytes();
         assert_eq!(bytes.len(), FEATURE_VECTOR_BYTES);
-        assert_eq!(FEATURE_VECTOR_BYTES, 64);
+        assert_eq!(FEATURE_VECTOR_BYTES, 72);
     }
 
     /// Round-trip: serialise then re-parse with byteorder.
@@ -281,23 +286,25 @@ mod tests {
         let bytes = fv.to_bytes();
         let mut cur = Cursor::new(bytes);
 
-        let entropy     = cur.read_f64::<LittleEndian>().unwrap();
-        let ewma_rate   = cur.read_f64::<LittleEndian>().unwrap();
-        let mean_h      = cur.read_f64::<LittleEndian>().unwrap();
-        let mean_r      = cur.read_f64::<LittleEndian>().unwrap();
-        let sigma_h     = cur.read_f64::<LittleEndian>().unwrap();
-        let sigma_r     = cur.read_f64::<LittleEndian>().unwrap();
-        let proto_ratio = cur.read_f64::<LittleEndian>().unwrap();
-        let timestamp   = cur.read_f64::<LittleEndian>().unwrap();
+        let entropy           = cur.read_f64::<LittleEndian>().unwrap();
+        let ewma_rate         = cur.read_f64::<LittleEndian>().unwrap();
+        let mean_h            = cur.read_f64::<LittleEndian>().unwrap();
+        let mean_r            = cur.read_f64::<LittleEndian>().unwrap();
+        let sigma_h           = cur.read_f64::<LittleEndian>().unwrap();
+        let sigma_r           = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_ratio       = cur.read_f64::<LittleEndian>().unwrap();
+        let dominant_ip_ratio = cur.read_f64::<LittleEndian>().unwrap();
+        let timestamp         = cur.read_f64::<LittleEndian>().unwrap();
 
-        assert!((entropy     - 4.321           ).abs() < 1e-9);
-        assert!((ewma_rate   - 1234.5          ).abs() < 1e-9);
-        assert!((mean_h      - 4.800           ).abs() < 1e-9);
-        assert!((mean_r      - 900.0           ).abs() < 1e-9);
-        assert!((sigma_h     - 0.250           ).abs() < 1e-9);
-        assert!((sigma_r     - 120.0           ).abs() < 1e-9);
-        assert!((proto_ratio - 0.72            ).abs() < 1e-9);
-        assert!((timestamp   - 1_700_000_000.0 ).abs() < 1e-3);
+        assert!((entropy           - 4.321           ).abs() < 1e-9);
+        assert!((ewma_rate         - 1234.5          ).abs() < 1e-9);
+        assert!((mean_h            - 4.800           ).abs() < 1e-9);
+        assert!((mean_r            - 900.0           ).abs() < 1e-9);
+        assert!((sigma_h           - 0.250           ).abs() < 1e-9);
+        assert!((sigma_r           - 120.0           ).abs() < 1e-9);
+        assert!((proto_ratio       - 0.72            ).abs() < 1e-9);
+        assert!((dominant_ip_ratio - 0.66            ).abs() < 1e-9);
+        assert!((timestamp         - 1_700_000_000.0 ).abs() < 1e-3);
     }
 
     /// FLAG constants must not overlap.
