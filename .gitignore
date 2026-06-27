@@ -5,6 +5,8 @@
 # =============================================================================
 # Rust / Cargo (Stage 1)
 # =============================================================================
+stage1/src/testing_results.txt
+attachments/*
 
 # Build output — the target/ directory is large (hundreds of MB) and fully
 # reproducible with `cargo build`. Never commit it.
