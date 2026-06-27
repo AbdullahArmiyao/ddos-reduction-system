@@ -19,32 +19,44 @@ The system is split into two stages:
 
 ---
 
-## Network Topology
+## Network Topology and Virtualization Gotchas
+
+In virtualized hypervisor environments (like Proxmox VE), the layout of your network bridges directly controls what traffic the Sensor VM can inspect.
+
+### The Virtual Switch Subnet Bypass Gotcha
+If the **Attacker VM** and **Victim VM** are placed on the same Proxmox bridge (e.g., `vmbr1`) and share the same IP subnet (e.g., `192.168.1.0/24`):
+1. They communicate directly host-to-host at Layer 2. The Proxmox host switch learns their MAC addresses and forwards packets directly between their virtual ports.
+2. Even if the Sensor VM is configured as their default gateway, **local subnet traffic bypasses the gateway**. 
+3. The Sensor VM's NIC (`ens19`) receives 0% of the unicast flood traffic. It will only capture broadcast packets (like ARP requests) or traffic sent directly to the Sensor's IP.
+
+---
+
+### The Routed Subnet Setup (192.168.1.0/24 -> 10.0.0.0/24)
+
+To ensure the Sensor VM can inspect and filter all traffic, the Attacker and Victim are separated into two distinct subnets connected by the Sensor VM acting as an IP Router:
 
 ```
-[ Attacker VM ] ──────────────────────────────────────────────┐
-                                                               │
-                         [ Sensor VM — br0 bridge ]           │
-                     ┌──────────────────────────────┐         │
-                     │  ddos_stage1 (Rust, Stage 1) │◄────────┘
-                     │  stage2.py   (Python, Stage 2)│
-                     └──────────────────────────────┘
-                                    │
-                                    │ (traffic passes through if clean)
-                                    ▼
-                          [ Victim VM — Nginx ]
+[ Attacker / Flash Crowd ]             [ Sensor VM / Gateway ]                 [ Victim VM ]
+  (Subnet: 192.168.1.0/24)             (Router/Firewall Gateway)          (Subnet: 10.0.0.0/24)
+  (IP: 192.168.1.4)                                │                      (IP: 10.0.0.3)
+         │                                         │                            │
+     [ vmbr1 ] <───────────────────────────────> [ens19]                        │
+   (LAN Segment 1)                       (IP: 192.168.1.2)                      │
+                                                 [ens20] <──────────────────> [ vmbr2 ]
+                                         (IP: 10.0.0.2)                     (LAN Segment 2)
 ```
 
-The Sensor VM acts as a **transparent Layer 2 bridge** (`br0`). All traffic between Attacker and Victim passes through it. The gateway software sits on that bridge and inspects every packet without the Attacker or Victim knowing it exists.
+*   **How it works:** The Attacker VM (`192.168.1.4`) wants to target the Victim VM (`10.0.0.3`). Because they are on different subnets, the Attacker is forced to route the traffic through its default gateway (`192.168.1.2` - the Sensor VM's ingress interface).
+*   **Where to capture:** Run `ddos_stage1` on the **ingress interface (`ens19`)** where the flood traffic first enters the gateway.
 
 ---
 
 ## The Three-Layer Pipeline (Stage 1)
 
-Every packet that enters `br0` addressed to the victim goes through this pipeline:
+Every packet that enters the ingress interface addressed to the victim goes through this pipeline:
 
 ```
-[ Packet arrives on br0 ]
+[ Packet arrives on ingress interface ]
          │
          │  BPF filter: dst host <victim_ip>  (kernel drops everything else)
          ▼
@@ -205,19 +217,40 @@ Fields are written manually with `byteorder` rather than transmuting the Rust st
 
 ---
 
-### 6. The Capture Thread and Crossbeam Channel
+### 6. The Capture Thread, BPF, and Memory Tuning
 
 **File:** `stage1/src/capture.rs`
 
-**Why a separate thread?** If capture and analysis ran in the same loop, every 50-packet window computation would stall the capture loop. Under a 100k pps flood, even microseconds of stall overflow the kernel's ring buffer — packets are silently dropped before Rust even sees them.
+**Why a separate thread?** If packet capture and analysis ran in the same thread, every 50-packet window calculation (calculating floating-point entropy and writing to sockets) would stall the capture loop. Under a 100k pps flood, even microseconds of stall overflow the kernel's raw socket buffer, leading to silent drops.
 
 **The solution:** Two threads connected by a bounded `crossbeam-channel`:
-- **Capture thread** calls `pcap::next_packet()` in a tight loop, parses headers with `etherparse`, sends `PacketMeta` into the channel. Never blocks on analysis.
-- **Analysis thread** receives from the channel and runs Layers 1–3.
+- **Capture thread** calls `pcap::next_packet()` in a tight loop, parses headers with `etherparse`, and sends `PacketMeta` into the channel. It never blocks on calculations.
+- **Analysis thread** receives from the channel and executes Layers 1–3.
 
-**Why bounded?** If the analysis thread falls behind, the channel fills and the capture thread *blocks* (backpressure) rather than allocating memory without limit. A bounded queue is safer than an unbounded one under sustained flood.
+#### Berkeley Packet Filter (BPF) — In-Kernel Gatekeeping
+Our Rust tool applies the filter `"dst host <victim_ip> or (vlan and dst host <victim_ip>)"` using the kernel's native BPF engine:
+*   **The Analogy (The Mailroom Sorter):** Imagine a huge corporate building (the OS). If you don't use BPF, the mailroom clerk (the kernel) must load every junk letter onto the elevator, ride to the top floor, and dump them on the CEO's desk (user-space Rust process) to be sorted. With BPF, a fast mechanical scanner sits on the basement loading dock. It scans the envelopes and shreds non-victim letters instantly. The elevator is never clogged.
+*   **The Tech:** The user-space filter compiles to BPF bytecode. The Linux kernel verifies the code for safety and uses a **Just-In-Time (JIT) compiler** to turn it into native x86 machine instructions. Packets matching the filter are cloned to our raw socket; everything else is discarded instantly in the kernel network driver.
 
-**BPF filter:** `dst host <victim_ip>` is applied at the kernel level before Rust sees a single byte. Outbound replies, ARP, and broadcast are discarded in the kernel — the analysis thread only ever sees inbound unicast packets destined for the victim.
+#### High-Speed Capture Performance Tuning
+To survive high-rate volumetric floods (1,000,000+ pps) without crashing the virtual machine, the capture module is tuned with three critical parameters:
+1.  **Reduced Snaplen (`snaplen = 256` bytes):** Instead of copying the full 64KB frame buffer to user-space (which saturates the CPU cache and memory bus), we only copy the first 256 bytes. This is more than enough to capture the Ethernet, VLAN, IPv4/IPv6, and TCP/UDP headers, reducing memory transfer costs by **99.6%**.
+2.  **Immediate Mode (`immediate_mode = true`):** Bypasses the kernel's internal buffering window. Packets are flushed to the socket buffer instantly rather than waiting for block retirement.
+3.  **Scaled Socket Buffer (`buffer_size = 128MB`):** Pins a 128MB ring buffer in kernel memory to act as a runway. If the Rust application experiences a brief context switch stall, the kernel can buffer up to ~1.3 million packet headers (at 96 bytes each) without drops.
+
+---
+
+### 7. Why a Hybrid Architecture? (Rust vs. Python)
+
+One might ask: *If the Rust pre-filter is running in user-space anyway, why not write the entire system in Python?* 
+
+The answer lies in the **Global Interpreter Lock (GIL)** and **runtime overhead**:
+
+*   **Python's Limitations under Flood:** Python is interpreted, garbage-collected, and bound by the GIL (only one thread can execute bytecode at a time, even on multi-core systems). Creating objects and running Scapy/PyShark parsers on every incoming packet caps Python's throughput at **~20,000 packets/second** before hitting 100% CPU.
+*   **Rust's Efficiency:** Rust compiles to native code, has no garbage collector, and has zero-cost abstractions. Zero-copy parsing allows it to handle **2,000,000+ packets/second** on a single thread.
+*   **The Division of Labor:**
+    *   **Stage 1 (Rust):** Handles the high-speed volumetric shield (1,000,000+ pps). It condenses millions of raw packets into a single summary `FeatureVector` per window.
+    *   **Stage 2 (Python):** Wakes up to process only **1 Feature Vector per window** (a tiny, low-rate stream of ~10–100 data points per second). At this volume, Python's performance overhead is negligible, allowing us to leverage Python's powerful machine learning libraries (`scikit-learn`, `pandas`) safely.
 
 ---
 
