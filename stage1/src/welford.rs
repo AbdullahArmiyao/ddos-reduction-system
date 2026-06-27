@@ -42,7 +42,7 @@
 /// How many Welford windows to accumulate before the running stats are
 /// considered "warm" enough to trust for anomaly decisions.
 /// During warm-up Layer 3 will not fire even if thresholds are breached.
-pub const WARMUP_WINDOWS: u64 = 30;
+pub const WARMUP_WINDOWS: u64 = 200;
 
 /// Maximum `n` the accumulator will count to before capping.  
 /// This limits how "frozen" the mean can become over a long-running session
@@ -92,6 +92,7 @@ impl WelfordAccumulator {
         // difference is the nudge factor (delta/n) stays at 1/max_n, which
         // keeps the mean responsive to recent traffic rather than frozen at a
         // historical average built up over millions of windows.
+        let at_cap = self.n >= self.max_n;
         self.n = (self.n + 1).min(self.max_n);
 
         // Step 1 — First deviation: how surprised are we *before* the mean moves?
@@ -107,7 +108,14 @@ impl WelfordAccumulator {
         // The product delta×delta2 is the exact correction needed to transition
         // the sum of squares from the old mean to the new mean without storing
         // any past data. A perfectly average sample contributes 0×0 = 0.
-        self.m2 += delta * delta2;
+        if at_cap {
+            // Apply exponential decay to M2 to match the recency cap of the mean.
+            // This prevents M2 (and thus variance/std_dev) from growing to infinity
+            // over a long-running session.
+            self.m2 = self.m2 * (1.0 - 1.0 / self.max_n as f64) + delta * delta2;
+        } else {
+            self.m2 += delta * delta2;
+        }
     }
 
     /// Population variance (σ²) using Bessel's correction (n−1).

@@ -113,7 +113,9 @@ pub struct CaptureConfig {
     /// Network interface to capture on (e.g., `"br0"`, `"eth0"`, `"ens3"`).
     pub interface: String,
     /// BPF filter string applied at the kernel level.
-    /// Should be `"dst host <victim_ip>"` in production.
+    /// Should be `"dst host <victim_ip> and ip"` in production.
+    /// The `and ip` clause restricts capture to IPv4 frames only, preventing
+    /// ARP, IPv6, and other non-IPv4 frames from reaching etherparse.
     /// Set to `""` (empty string) to disable filtering (dev/test only).
     pub bpf_filter: String,
     /// pcap snapshot length in bytes — only this many bytes of each frame are
@@ -138,8 +140,11 @@ impl CaptureConfig {
     pub fn for_bridge(interface: &str, victim_ip: &str) -> Self {
         Self {
             interface:   interface.to_string(),
-            // Support both standard and VLAN-tagged frames matching the victim IP
-            bpf_filter:  format!("dst host {victim_ip} or (vlan and dst host {victim_ip})"),
+            // Restrict to IPv4 frames destined for the victim.
+            // 'and ip' blocks ARP, IPv6, and other non-IPv4 frames before they
+            // reach etherparse, eliminating the skip storm seen under Locust load.
+            // VLAN branch handles environments with 802.1Q-tagged frames.
+            bpf_filter:  format!("(dst host {victim_ip} and ip) or (vlan and dst host {victim_ip} and ip)"),
             snaplen:     256,   // Capture only header bytes (optimizes memory copy speed under flood)
             timeout_ms:  100,   // 100 ms flush window (prevents Linux TPACKET ring buffer packet drops)
             promiscuous: true,  // bridge must see all passing frames

@@ -249,8 +249,6 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         let rate_boundary    = welford_rate.upper_boundary(cfg.k);
         let entropy_boundary = welford_entropy.lower_boundary(cfg.k);
 
-        let rate_breach    = r < rate_boundary;    // No anomaly (normal case).
-        let entropy_breach = h > entropy_boundary; // No anomaly (normal case).
 
         // Build anomaly flags bitmask.
         let mut anomaly_flags: u8 = 0;
@@ -292,7 +290,6 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             }
         } else {
             // Normal window — no anomaly. Log at debug level only.
-            let _ = (rate_breach, entropy_breach); // suppress unused warnings
             log::debug!("Window #{window_id}: NORMAL | r={r:.1} | h={h:.4}");
         }
     }

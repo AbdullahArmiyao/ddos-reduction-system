@@ -82,6 +82,7 @@ struct CliArgs {
     alpha:     f64,
     socket:    String,
     no_filter: bool,
+    log_file:  Option<String>,
 }
 
 impl CliArgs {
@@ -94,6 +95,7 @@ impl CliArgs {
         let mut alpha     = ewma::DEFAULT_ALPHA;
         let mut socket    = ipc::SOCKET_PATH.to_string();
         let mut no_filter = false;
+        let mut log_file: Option<String> = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -125,6 +127,10 @@ impl CliArgs {
                 "--no-filter" => {
                     no_filter = true;
                 }
+                "--log-file" => {
+                    i += 1;
+                    log_file = args.get(i).cloned();
+                }
                 "--help" | "-h" => {
                     print_usage(&args[0]);
                     process::exit(0);
@@ -145,7 +151,7 @@ impl CliArgs {
             process::exit(1);
         }
 
-        Self { interface, victim_ip, k, alpha, socket, no_filter }
+        Self { interface, victim_ip, k, alpha, socket, no_filter, log_file }
     }
 }
 
@@ -160,6 +166,7 @@ fn print_usage(bin: &str) {
     eprintln!("  --alpha      <FLOAT>   EWMA smoothing alpha  [default: 0.125]");
     eprintln!("  --socket     <PATH>    IPC socket path       [default: /tmp/ddos_stage1.sock]");
     eprintln!("  --no-filter            Disable BPF filter (dev/test only)");
+    eprintln!("  --log-file   <PATH>    Path to write logs to in addition to terminal");
     eprintln!("  --help, -h             Show this message");
     eprintln!();
     eprintln!("Environment:");
@@ -172,21 +179,64 @@ fn print_usage(bin: &str) {
 // main()
 // =============================================================================
 fn main() {
+    // Parse CLI arguments first so we know if a log file is requested.
+    let args = CliArgs::parse();
+
+    // Setup logging target
+    let log_file = if let Some(ref path) = args.log_file {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!("[ERROR] Failed to open log file '{}': {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    struct LogSplitter {
+        file: Option<std::fs::File>,
+    }
+
+    impl std::io::Write for LogSplitter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let stderr = std::io::stderr();
+            let mut handle = stderr.lock();
+            let _ = handle.write_all(buf);
+
+            if let Some(ref mut f) = self.file {
+                let _ = f.write_all(buf);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let _ = std::io::stderr().flush();
+            if let Some(ref mut f) = self.file {
+                let _ = f.flush();
+            }
+            Ok(())
+        }
+    }
+
     // Initialise the env_logger — reads RUST_LOG env var for level.
     // Defaults to INFO if RUST_LOG is not set.
-    env_logger::Builder::from_env(
+    let mut builder = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
-    )
-    .format_timestamp_millis()
-    .init();
+    );
+    builder.format_timestamp_millis();
+    builder.target(env_logger::Target::Pipe(Box::new(LogSplitter { file: log_file })));
+    builder.init();
 
     info!("╔══════════════════════════════════════════════════════════╗");
     info!("║  Adaptive DDoS Pre-Filter — Stage 1 (Rust)              ║");
     info!("║  Abdullah Armiyao | ***REMOVED*** | ***REMOVED*** ***REMOVED***      ║");
     info!("╚══════════════════════════════════════════════════════════╝");
-
-    // Parse CLI arguments.
-    let args = CliArgs::parse();
 
     // -------------------------------------------------------------------------
     // Build the capture and analysis configurations.
