@@ -10,6 +10,7 @@ and triggers kernel-level mitigation via ipset for DDoS.
 
 import os
 import sys
+import time
 import socket
 import struct
 import ipaddress
@@ -19,7 +20,8 @@ import joblib
 
 # Constants
 SOCKET_PATH = "/tmp/ddos_stage1.sock"
-MODEL_PATH = "ddos_rf_model.joblib"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(SCRIPT_DIR, "ddos_rf_model.joblib")
 FEATURE_VECTOR_FORMAT = "<9d16s"  # 9 x f64 (72 bytes) + 16-byte IP address = 88 bytes
 PAYLOAD_SIZE = struct.calcsize(FEATURE_VECTOR_FORMAT)
 
@@ -75,8 +77,24 @@ def setup_ipset():
     except Exception as e:
         logging.warning(f"[-] Could not setup/verify ipset or iptables (is sudo missing?): {e}")
 
+# Keep track of recently blocked IPs to prevent subprocess fork bottleneck
+recently_blocked = {}
+
 def block_ip(ip):
-    """Add offending IP to ddos_blocklist."""
+    """Add offending IP to ddos_blocklist with rate-limiting."""
+    global recently_blocked
+    now = time.time()
+    
+    if ip in recently_blocked:
+        # Skip if already blocked in the last 10 seconds
+        if now - recently_blocked[ip] < 10.0:
+            return
+            
+    # Periodic pruning if the cache gets too large (e.g. under massive spoofed IP flood)
+    if len(recently_blocked) > 5000:
+        cutoff = now - 60.0
+        recently_blocked = {k: v for k, v in recently_blocked.items() if v > cutoff}
+        
     try:
         # Run ipset add ddos_blocklist <ip>
         res = subprocess.run(
@@ -90,6 +108,8 @@ def block_ip(ip):
             logging.error(f"[-] Failed to block IP {ip}: {res.stderr.strip()}")
     except Exception as e:
         logging.error(f"[-] Error calling ipset: {e}")
+    finally:
+        recently_blocked[ip] = now
 
 def decode_ip(ip_bytes):
     """Decode 16-byte IPv6 representation to standard IPv4 or IPv6 string."""
@@ -185,6 +205,10 @@ def main():
                     raw_ip = unpacked[9]
                     ip_str = decode_ip(raw_ip)
                     
+                    # Calculate delta features
+                    delta_rate = ewma_rate - mean_r
+                    delta_entropy = entropy - mean_h
+
                     # Assemble feature vector for classification
                     import pandas as pd
                     features_df = pd.DataFrame([[
@@ -195,7 +219,9 @@ def main():
                         sigma_h,
                         sigma_r,
                         proto_ratio,
-                        dominant_ip_ratio
+                        dominant_ip_ratio,
+                        delta_rate,
+                        delta_entropy
                     ]], columns=[
                         "entropy",
                         "ewma_rate",
@@ -204,11 +230,36 @@ def main():
                         "sigma_h",
                         "sigma_r",
                         "proto_ratio",
-                        "dominant_ip_ratio"
+                        "dominant_ip_ratio",
+                        "delta_rate",
+                        "delta_entropy"
                     ])
                     
                     # Predict Traffic Class
+                    logging.info(f"ML Input Features: {features_df.to_dict('records')[0]}")
                     pred_class = int(clf.predict(features_df)[0])
+                    
+                    # Safety Override: A rate above 2000 pps can never be "Normal" (0)
+                    if pred_class == 0 and ewma_rate > 2000.0:
+                        # Override to DDoS or Flash Crowd based on rate, entropy, and dominant IP ratio
+                        if ewma_rate > 10000.0:
+                            pred_class = 2 # DDoS (Volumetric flood)
+                            logging.warning(
+                                f"[SAFETY OVERRIDE] Extremely high rate ({ewma_rate:.1f} pps) "
+                                f"classified as Normal by ML. Overriding to DDoS (2)."
+                            )
+                        elif entropy < 3.5 or dominant_ip_ratio > 0.25:
+                            pred_class = 2 # DDoS (Single-source or small subnet flood)
+                            logging.warning(
+                                f"[SAFETY OVERRIDE] High rate ({ewma_rate:.1f} pps) with low entropy/high dominant IP "
+                                f"classified as Normal by ML. Overriding to DDoS (2)."
+                            )
+                        else:
+                            pred_class = 1 # Flash Crowd
+                            logging.warning(
+                                f"[SAFETY OVERRIDE] High rate ({ewma_rate:.1f} pps) with high entropy "
+                                f"classified as Normal by ML. Overriding to Flash Crowd (1)."
+                            )
                     
                     class_labels = {
                         0: "Normal",

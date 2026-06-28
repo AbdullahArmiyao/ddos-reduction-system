@@ -322,6 +322,13 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             anomaly_flags |= FLAG_ENTROPY_ANOMALY;
         }
 
+        // Determine if this window breached the original configuration-level threshold (real anomaly).
+        // This prevents the system from getting trapped in an infinite cooldown loop due to minor
+        // normal fluctuations breaching the tighter active_k.
+        let real_rate_boundary = welford_rate.mean + cfg.k * sigma_r;
+        let real_entropy_boundary = welford_entropy.mean - cfg.k * sigma_h;
+        let is_real_anomaly = r > real_rate_boundary || h < real_entropy_boundary;
+
         // 3. Conditional Updates: Feed scalars into Welford accumulators ONLY if the window is clean
         // and we are not in cooldown. This keeps the baseline stable and prevents statistical explosion.
         if anomaly_flags == 0 && cooldown_counter == 0 {
@@ -329,8 +336,8 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             welford_entropy.update(h);
         }
 
-        // Manage cooldown counter: if anomaly detected, set to 10. Otherwise decrement.
-        if anomaly_flags != 0 {
+        // Manage cooldown counter: if a real anomaly is detected, set to 10. Otherwise decrement.
+        if is_real_anomaly {
             cooldown_counter = 10;
         } else if cooldown_counter > 0 {
             cooldown_counter -= 1;
