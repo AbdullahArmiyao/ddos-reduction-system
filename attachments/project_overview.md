@@ -18,7 +18,10 @@ scripts/
 ├── install.sh              ← Linux installer (Debian/Ubuntu, RHEL/Fedora, Alpine)
 ├── install.bat             ← Windows installer (dev/test only)
 ├── update.sh               ← Atomic update: stop → rebuild → replace → restart
-└── uninstall.sh            ← Full teardown: service + binary + socket
+├── uninstall.sh            ← Full teardown: service + binary + socket
+└── run.sh                  ← Interactive testing runner daemon launcher
+
+run.sh                      ← Shortcut symlink/redirect script in project root
 ```
 
 ## The Routed Subnet Setup (192.168.1.0/24 $\rightarrow$ 10.0.0.0/24)
@@ -84,15 +87,21 @@ To ensure the Sensor VM can inspect and filter all traffic, the Attacker and Vic
 
 ## Run Command (on gateway)
 
+To start both Stage 1 and Stage 2 together interactively in testing mode:
+```bash
+sudo ./run.sh --interface ens19 --victim-ip 10.0.0.3
+```
+
+To run Stage 1 individually:
 ```bash
 # Listen on ingress interface ens19 targeting the victim IP
 sudo ./ddos_stage1 --interface ens19 --victim-ip 10.0.0.3
 ```
 
-Or via systemd after `install.sh`:
+Or via systemd after running the installer:
 ```bash
 systemctl enable --now ddos-stage1
-journalctl -u ddos-stage1 -f
+systemctl enable --now ddos-stage2
 ```
 
 ## Key Design Decisions

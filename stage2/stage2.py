@@ -34,7 +34,7 @@ logging.basicConfig(
 )
 
 def setup_ipset():
-    """Ensure the target ipset list exists."""
+    """Ensure the target ipset list exists and is linked to iptables rules."""
     try:
         # Create hash:ip set if it doesn't exist
         subprocess.run(
@@ -43,8 +43,37 @@ def setup_ipset():
             stderr=subprocess.DEVNULL
         )
         logging.info("[+] Kernel ipset 'ddos_blocklist' verified/created (timeout = 3600s).")
+
+        # Link ipset to iptables INPUT chain if not already present
+        check_input = subprocess.run(
+            ["iptables", "-C", "INPUT", "-m", "set", "--match-set", "ddos_blocklist", "src", "-j", "DROP"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if check_input.returncode != 0:
+            subprocess.run(
+                ["iptables", "-I", "INPUT", "-m", "set", "--match-set", "ddos_blocklist", "src", "-j", "DROP"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            logging.info("[+] Linked 'ddos_blocklist' to iptables INPUT chain.")
+            
+        # Link ipset to iptables FORWARD chain if not already present
+        check_forward = subprocess.run(
+            ["iptables", "-C", "FORWARD", "-m", "set", "--match-set", "ddos_blocklist", "src", "-j", "DROP"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if check_forward.returncode != 0:
+            subprocess.run(
+                ["iptables", "-I", "FORWARD", "-m", "set", "--match-set", "ddos_blocklist", "src", "-j", "DROP"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            logging.info("[+] Linked 'ddos_blocklist' to iptables FORWARD chain.")
+
     except Exception as e:
-        logging.warning(f"[-] Could not setup/verify ipset (is sudo missing?): {e}")
+        logging.warning(f"[-] Could not setup/verify ipset or iptables (is sudo missing?): {e}")
 
 def block_ip(ip):
     """Add offending IP to ddos_blocklist."""
@@ -157,7 +186,8 @@ def main():
                     ip_str = decode_ip(raw_ip)
                     
                     # Assemble feature vector for classification
-                    features = [[
+                    import pandas as pd
+                    features_df = pd.DataFrame([[
                         entropy,
                         ewma_rate,
                         mean_h,
@@ -166,10 +196,19 @@ def main():
                         sigma_r,
                         proto_ratio,
                         dominant_ip_ratio
-                    ]]
+                    ]], columns=[
+                        "entropy",
+                        "ewma_rate",
+                        "mean_h",
+                        "mean_r",
+                        "sigma_h",
+                        "sigma_r",
+                        "proto_ratio",
+                        "dominant_ip_ratio"
+                    ])
                     
                     # Predict Traffic Class
-                    pred_class = int(clf.predict(features)[0])
+                    pred_class = int(clf.predict(features_df)[0])
                     
                     class_labels = {
                         0: "Normal",

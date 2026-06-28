@@ -124,6 +124,8 @@ STAGE2_PID=""
 STAGE1_PID=""
 
 cleanup() {
+    # Reset traps immediately to prevent duplicate execution when the shell exits
+    trap - EXIT SIGINT SIGTERM SIGHUP
     echo ""
     info "Teardown signal received. Cleaning up processes..."
     

@@ -221,6 +221,30 @@ fn main() {
         file: Option<std::fs::File>,
     }
 
+    impl LogSplitter {
+        fn strip_ansi(buf: &[u8]) -> Vec<u8> {
+            let mut clean = Vec::with_capacity(buf.len());
+            let mut i = 0;
+            while i < buf.len() {
+                if buf[i] == 0x1b {
+                    if i + 1 < buf.len() && buf[i + 1] == b'[' {
+                        i += 2;
+                        while i < buf.len() && (buf[i] < 0x40 || buf[i] > 0x7E) {
+                            i += 1;
+                        }
+                        if i < buf.len() {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                clean.push(buf[i]);
+                i += 1;
+            }
+            clean
+        }
+    }
+
     impl std::io::Write for LogSplitter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             let stderr = std::io::stderr();
@@ -228,7 +252,8 @@ fn main() {
             let _ = handle.write_all(buf);
 
             if let Some(ref mut f) = self.file {
-                let _ = f.write_all(buf);
+                let clean = Self::strip_ansi(buf);
+                let _ = f.write_all(&clean);
             }
             Ok(buf.len())
         }
@@ -247,7 +272,19 @@ fn main() {
     let mut builder = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
     );
-    builder.format_timestamp_millis();
+    builder.write_style(env_logger::WriteStyle::Always);
+    builder.format(|buf, record| {
+        use std::io::Write;
+        let level_style = buf.default_level_style(record.level());
+        writeln!(
+            buf,
+            "[{} {level_style}{:<5}{level_style:#} {}] {}",
+            buf.timestamp_millis(),
+            record.level(),
+            record.target(),
+            record.args()
+        )
+    });
     builder.target(env_logger::Target::Pipe(Box::new(LogSplitter { file: log_file })));
     builder.init();
 

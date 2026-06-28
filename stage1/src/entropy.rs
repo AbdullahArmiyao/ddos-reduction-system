@@ -119,6 +119,7 @@ impl EntropyAccumulator {
 
     /// Peek at the current packet count without consuming the window.
     /// Useful for the analysis thread's progress logging.
+    #[allow(dead_code)]
     pub fn packet_count(&self) -> usize {
         self.packet_count
     }

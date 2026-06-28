@@ -98,6 +98,7 @@ pub struct PacketMeta {
     pub src_ip: IpAddr,
     /// High-resolution monotonic timestamp recorded *immediately* after pcap
     /// delivers the frame to user space. Used by EWMA for inter-arrival timing.
+    #[allow(dead_code)]
     pub arrived_at: Instant,
     /// Layer 4 protocol — used by the analysis thread to build proto_ratio.
     pub protocol: Protocol,

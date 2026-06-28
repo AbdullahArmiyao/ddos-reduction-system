@@ -314,13 +314,27 @@ install.bat
 
 ## Usage
 
+### Interactive Testing (Run Both Stages Together)
+
+For testing environments or manual execution, a unified runner script is provided in the project root. This starts the Stage 2 Python ML engine in the background, waits for its IPC socket to initialize, starts the Stage 1 Rust capture filter in the foreground, and handles graceful teardown on `Ctrl+C`:
+
+```bash
+# Start both stages with default settings (ens19 interface, 10.0.0.3 victim IP)
+sudo ./run.sh
+
+# Start both stages with custom settings
+sudo ./run.sh --interface ens19 --victim-ip 10.0.0.3
+```
+
+### Individual Components Usage
+
+If you prefer to run the components separately:
+
+#### 1. Stage 1 Rust Pre-Filter
 ```bash
 # Production (on sensor VM)
 sudo ddos_stage1 --interface ens19 --victim-ip 10.0.0.3
-
-# Development (no BPF filter, any interface)
-RUST_LOG=debug sudo ddos_stage1 --interface lo --no-filter
-
+```
 # All options
 ddos_stage1 --interface <IFACE>     # required
             --victim-ip <IP>        # BPF filter target

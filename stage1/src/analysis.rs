@@ -176,6 +176,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     let mut ip_counts: HashMap<IpAddr, u32> = HashMap::new();
     let mut window_packet_count: usize = 0;
     let mut last_window_close = Instant::now();
+    let mut cooldown_counter: usize = 0;
 
     // -------------------------------------------------------------------------
     // Main loop — one iteration per packet received from the capture thread.
@@ -221,7 +222,16 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         } else {
             0.0
         };
-        ewma.update_rate(window_rate);
+        
+        // Asymmetric decay: Use an aggressive alpha (e.g. 0.5) when the window rate is decreasing
+        // compared to the current EWMA value, or when we are in a cooldown recovery window.
+        // Otherwise, use the standard configured alpha (e.g. 0.125) to avoid reacting to single transient spikes.
+        let active_alpha = if window_rate < ewma.snapshot() || cooldown_counter > 0 {
+            0.5f64.max(cfg.ewma_alpha)
+        } else {
+            cfg.ewma_alpha
+        };
+        ewma.update_rate_with_alpha(window_rate, active_alpha);
 
         // Compute Shannon Entropy scalar h from the current window's IP distribution.
         // This call clears the internal HashMap and resets the packet counter.
@@ -262,24 +272,16 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         icmp_count = 0;
 
         // =====================================================================
-        // LAYER 3 — Welford Update and Anomaly Evaluation
+        // LAYER 3 — Anomaly Evaluation and Welford Update
         // =====================================================================
-
-        // Feed both scalars into their respective Welford accumulators.
-        welford_rate.update(r);
-        welford_entropy.update(h);
-
-        // Log the current window summary at debug level.
-        log::debug!(
-            "Window #{window_id}: r={r:.2} pps | h={h:.4} bits | \
-             μ_r={:.2} σ_r={:.2} | μ_h={:.4} σ_h={:.4}",
-            welford_rate.mean, welford_rate.std_dev(),
-            welford_entropy.mean, welford_entropy.std_dev()
-        );
 
         // Do not evaluate thresholds during the warm-up period — the Welford
         // mean and variance are too noisy on a small sample to be trustworthy.
         if !welford_rate.is_warm() || !welford_entropy.is_warm() {
+            // During warm-up, always update the Welford trackers.
+            welford_rate.update(r);
+            welford_entropy.update(h);
+
             info!(
                 "Analysis: warm-up window {}/{} | r={r:.1} pps | h={h:.3} bits",
                 welford_rate.n, crate::welford::WARMUP_WINDOWS
@@ -287,13 +289,29 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             continue;
         }
 
-        // Evaluate the two anomaly thresholds.
-        //
-        // Rate breach  : current rate r is above the upper boundary (flood).
-        // Entropy breach: current entropy h is below the lower boundary (concentrated source).
-        let rate_boundary    = welford_rate.upper_boundary(cfg.k);
-        let entropy_boundary = welford_entropy.lower_boundary(cfg.k);
+        // Get raw standard deviations
+        let raw_sigma_r = welford_rate.std_dev();
+        let raw_sigma_h = welford_entropy.std_dev();
 
+        // 1. Sigma Ceiling: Cap the standard deviation to prevent the boundaries from drifting too wide.
+        // Cap rate standard deviation at 10000.0 pps or 20% of the mean (whichever is larger).
+        let ceiling_r = (0.2 * welford_rate.mean).max(10000.0);
+        let sigma_r = raw_sigma_r.min(ceiling_r);
+
+        // Cap entropy standard deviation at 0.5 bits.
+        let sigma_h = raw_sigma_h.min(0.5);
+
+        // 2. High-Sensitivity Cooldown Mode: If we are within the cooldown recovery window,
+        // reduce the anomaly threshold multiplier k to increase sensitivity to subsequent attack pulses.
+        let active_k = if cooldown_counter > 0 {
+            (cfg.k * 0.5).max(1.0)
+        } else {
+            cfg.k
+        };
+
+        // Evaluate the two anomaly thresholds.
+        let rate_boundary    = welford_rate.mean + active_k * sigma_r;
+        let entropy_boundary = welford_entropy.mean - active_k * sigma_h;
 
         // Build anomaly flags bitmask.
         let mut anomaly_flags: u8 = 0;
@@ -303,6 +321,29 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         if h < entropy_boundary {
             anomaly_flags |= FLAG_ENTROPY_ANOMALY;
         }
+
+        // 3. Conditional Updates: Feed scalars into Welford accumulators ONLY if the window is clean
+        // and we are not in cooldown. This keeps the baseline stable and prevents statistical explosion.
+        if anomaly_flags == 0 && cooldown_counter == 0 {
+            welford_rate.update(r);
+            welford_entropy.update(h);
+        }
+
+        // Manage cooldown counter: if anomaly detected, set to 10. Otherwise decrement.
+        if anomaly_flags != 0 {
+            cooldown_counter = 10;
+        } else if cooldown_counter > 0 {
+            cooldown_counter -= 1;
+        }
+
+        // Log the current window summary at debug level.
+        log::debug!(
+            "Window #{window_id}: r={r:.2} pps | h={h:.4} bits | \
+             μ_r={:.2} σ_r={:.2} (active={:.2}) | μ_h={:.4} σ_h={:.4} (active={:.4}) | cooldown={}",
+            welford_rate.mean, raw_sigma_r, sigma_r,
+            welford_entropy.mean, raw_sigma_h, sigma_h,
+            cooldown_counter
+        );
 
         // =====================================================================
         // Signal Stage 2 if any anomaly was detected.
@@ -320,8 +361,8 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 ewma_rate:   r,
                 mean_h:      welford_entropy.mean,
                 mean_r:      welford_rate.mean,
-                sigma_h:     welford_entropy.std_dev(),
-                sigma_r:     welford_rate.std_dev(),
+                sigma_h,
+                sigma_r,
                 proto_ratio,
                 dominant_ip_ratio,
                 timestamp,
@@ -349,7 +390,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 "{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.3},{}",
                 h, r,
                 welford_entropy.mean, welford_rate.mean,
-                welford_entropy.std_dev(), welford_rate.std_dev(),
+                sigma_h, sigma_r,
                 proto_ratio, dominant_ip_ratio,
                 timestamp,
                 cfg.train_label

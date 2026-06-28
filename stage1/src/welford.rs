@@ -141,6 +141,7 @@ impl WelfordAccumulator {
     ///
     /// Used by the EWMA rate accumulator — a spike *above* this boundary
     /// means the packet rate has surged beyond normal levels.
+    #[allow(dead_code)]
     pub fn upper_boundary(&self, k: f64) -> f64 {
         self.mean + k * self.std_dev()
     }
@@ -149,6 +150,7 @@ impl WelfordAccumulator {
     ///
     /// Used by the entropy accumulator — a drop *below* this boundary
     /// means traffic sources have become abnormally concentrated (DDoS pattern).
+    #[allow(dead_code)]
     pub fn lower_boundary(&self, k: f64) -> f64 {
         self.mean - k * self.std_dev()
     }
@@ -160,6 +162,7 @@ impl WelfordAccumulator {
     }
 
     /// Reset all state (used in unit tests and optional periodic re-baseline).
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.n    = 0;
         self.mean = 0.0;

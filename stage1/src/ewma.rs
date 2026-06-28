@@ -75,6 +75,7 @@ pub struct EwmaState {
     /// Smoothing factor α ∈ (0, 1).
     alpha: f64,
     /// Timestamp of the most recently seen packet (for inter-arrival calculation).
+    #[allow(dead_code)]
     last_arrival: Option<Instant>,
 }
 
@@ -112,6 +113,7 @@ impl EwmaState {
     /// # Arguments
     /// * `now` — the timestamp of the arriving packet (usually `Instant::now()`
     ///   captured immediately after `pcap` delivers the frame).
+    #[allow(dead_code)]
     pub fn update(&mut self, now: Instant) {
         if let Some(prev) = self.last_arrival {
             let dt_secs = now.duration_since(prev).as_secs_f64();
@@ -147,11 +149,18 @@ impl EwmaState {
     }
 
     /// Update the EWMA rate directly with a pre-calculated rate sample.
+    #[allow(dead_code)]
     pub fn update_rate(&mut self, rate: f64) {
         self.value = self.alpha * rate + (1.0 - self.alpha) * self.value;
     }
 
+    /// Update the EWMA rate directly with a pre-calculated rate sample and custom alpha.
+    pub fn update_rate_with_alpha(&mut self, rate: f64, alpha: f64) {
+        self.value = alpha * rate + (1.0 - alpha) * self.value;
+    }
+
     /// Expose the current alpha for logging / debugging.
+    #[allow(dead_code)]
     pub fn alpha(&self) -> f64 {
         self.alpha
     }
