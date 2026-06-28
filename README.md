@@ -66,14 +66,13 @@ Every packet that enters the ingress interface addressed to the victim goes thro
          │
          ▼
 [ LAYER 1: per-packet — Analysis Thread ]
-   ├── EwmaState::update(timestamp)      updates smoothed rate estimate
    └── EntropyAccumulator::add(src_ip)   increments IP frequency counter
          │
          │  (every 50th packet — window closes)
          ▼
 [ LAYER 2: per-window ]
    ├── h = entropy.compute_and_reset()   → diversity scalar  [0.0 .. 5.64 bits]
-   └── r = ewma.snapshot()               → rate scalar       [0.0 .. ∞ pps]
+   └── r = ewma.update(window_duration)  → rate scalar       [0.0 .. ∞ pps]
          │
          ▼
 [ LAYER 3: per-window ]
@@ -125,13 +124,13 @@ Then: `variance = M2 / (n - 1)`
 
 **File:** `stage1/src/ewma.rs`
 
-**The problem it solves:** You need a *rate* (packets per second) that reacts quickly to floods but isn't thrown off by a single bursty moment. A Simple Moving Average weights all past samples equally — it's slow to react. EWMA weights recent samples exponentially more.
+**The problem it solves:** You need a *rate* (packets per second) that reacts quickly to floods but isn't thrown off by a single bursty packet interval or scheduling delays.
 
-**The formula:**
-
+**How it works (Jitter-Resistant design):**
+Instead of updating the EWMA rate per packet (which suffers from massive timing jitter spikes due to OS interrupt coalescing or virtualization scheduling), Stage 1 calculates the rate **once per 50-packet window** using the window's exact elapsed time:
 ```
-instant_rate = 1.0 / time_between_last_two_packets   (seconds)
-ewma_new     = α · instant_rate + (1 − α) · ewma_old
+window_rate = WINDOW_SIZE / window_duration_seconds
+ewma_new    = α · window_rate + (1 − α) · ewma_old
 ```
 
 `α` (alpha) controls responsiveness:
@@ -201,17 +200,22 @@ Stage 2 uses this flag plus four additional features in the Random Forest to mak
 
 When Stage 1 flags an anomaly, it serialises a `FeatureVector` struct and sends it over a Unix Domain Socket to Stage 2 (Python).
 
-The wire format is **exactly 33 bytes, little-endian**:
+The wire format is **exactly 88 bytes, little-endian**:
 
-| Offset | Size | Field | Type |
-|---|---|---|---|
-| 0 | 8 bytes | `ewma_rate` | f64 |
-| 8 | 8 bytes | `entropy` | f64 |
-| 16 | 8 bytes | `dominant_ip_ratio` | f64 |
-| 24 | 1 byte | `anomaly_flags` | u8 |
-| 25 | 8 bytes | `window_id` | u64 |
+| Offset | Size | Field | Type | Description |
+|---|---|---|---|---|
+| 0 | 8 bytes | `entropy` | f64 | Shannon source IP entropy |
+| 8 | 8 bytes | `ewma_rate` | f64 | EWMA packet rate (pps) |
+| 16 | 8 bytes | `mean_h` | f64 | Running mean of entropy |
+| 24 | 8 bytes | `mean_r` | f64 | Running mean of EWMA rate |
+| 32 | 8 bytes | `sigma_h` | f64 | Standard deviation of entropy |
+| 40 | 8 bytes | `sigma_r` | f64 | Standard deviation of EWMA rate |
+| 48 | 8 bytes | `proto_ratio` | f64 | TCP packet ratio (vs UDP/ICMP) |
+| 56 | 8 bytes | `dominant_ip_ratio` | f64 | Ratio of packets from busiest IP |
+| 64 | 8 bytes | `timestamp` | f64 | UNIX timestamp of window close |
+| 72 | 16 bytes | `dominant_ip` | [u8; 16] | Busiest source IP (IPv6 or mapped IPv4) |
 
-Python unpacks it with: `struct.unpack('<dddBQ', data)`
+Python unpacks it with: `struct.unpack('<9d16s', data)`
 
 Fields are written manually with `byteorder` rather than transmuting the Rust struct directly. This eliminates invisible padding bugs — Rust structs can insert alignment padding that `struct.unpack` wouldn't know about.
 
@@ -390,10 +394,10 @@ The golden vector `[4, 7, 13, 16]` → `mean=10.0, variance=30.0` is verified on
 ## Update and Uninstall
 
 ```bash
-# Update (rebuild + atomic binary replace + reapply capabilities)
+# Update (rebuild Rust + update Python dependencies + restart services)
 sudo bash scripts/update.sh
 
-# Uninstall (removes binary, service unit, socket file)
+# Uninstall (removes binaries, venv, service units, socket file)
 sudo bash scripts/uninstall.sh
 
 # Full uninstall including build cache and Rust toolchain
@@ -402,33 +406,40 @@ sudo bash scripts/uninstall.sh --remove-build --remove-rust
 
 ---
 
-## Stage 2 — Coming Next (Python)
+## Stage 2 Integration (Python)
 
-Stage 2 will listen on `/tmp/ddos_stage1.sock`, unpack incoming `FeatureVector` structs, and run them through a trained Random Forest classifier.
+Stage 2 listens on `/tmp/ddos_stage1.sock`, unpacks incoming 88-byte `FeatureVector` structs, and classifies traffic in real-time.
 
 ```python
 import socket, struct
 
 # Python-side wire format (matches Rust exactly)
-FORMAT = '<dddBQ'   # little-endian: f64 f64 f64 u8 u64 = 33 bytes
-FIELDS = ('ewma_rate', 'entropy', 'dominant_ip_ratio', 'anomaly_flags', 'window_id')
+FORMAT = '<9d16s'   # little-endian: 9 x f64 + 16-byte IP address = 88 bytes
+FIELDS = (
+    'entropy', 'ewma_rate', 'mean_h', 'mean_r', 'sigma_h', 'sigma_r',
+    'proto_ratio', 'dominant_ip_ratio', 'timestamp', 'dominant_ip'
+)
 
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
     srv.bind('/tmp/ddos_stage1.sock')
     srv.listen(1)
     conn, _ = srv.accept()
-    data = conn.recv(33)
+    data = conn.recv(88)
     values = struct.unpack(FORMAT, data)
-    fv = dict(zip(FIELDS, values))
-    # → pass to RandomForestClassifier, then ipset block or k-decay widen
+    fv = dict(zip(FIELDS[:-1], values[:-1]))
+    # dominant_ip is values[-1] (16 bytes)
+    # → pass features to RandomForestClassifier, then block dominant_ip using ipset
 ```
 
-The five features fed to the classifier:
-1. Source IP Entropy
-2. Packet Rate Deviation (EWMA)
-3. Packet Size Variance *(added in Stage 2)*
-4. SYN/ACK Ratio *(added in Stage 2)*
-5. Layer 4 Protocol Distribution *(added in Stage 2)*
+The eight features fed to the Random Forest classifier:
+1. Source IP Entropy (`entropy`)
+2. Packet Rate (`ewma_rate`)
+3. Entropy Running Mean (`mean_h`)
+4. Packet Rate Running Mean (`mean_r`)
+5. Entropy Standard Deviation (`sigma_h`)
+6. Packet Rate Standard Deviation (`sigma_r`)
+7. Protocol Ratio (`proto_ratio`)
+8. Dominant Source IP Ratio (`dominant_ip_ratio`)
 
 ---
 

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # =============================================================================
-# uninstall.sh — Stage 1 Uninstall Script
+# uninstall.sh — Stage 1 & 2 Uninstall Script
 # =============================================================================
 #
-# Completely removes Stage 1 from the system:
-#   1. Stops and disables the systemd service unit.
-#   2. Removes the systemd unit file.
-#   3. Removes the installed binary.
-#   4. Optionally removes compiled build artefacts (target/ directory).
-#   5. Optionally removes the Rust toolchain (rustup self uninstall).
-#   6. Removes the IPC socket file if it exists.
+# Completely removes Stage 1 & 2 from the system:
+#   1. Stops and disables systemd service units for both stages.
+#   2. Removes the service unit files.
+#   3. Removes the installed Stage 1 binary.
+#   4. Removes the Stage 2 Python virtual environment.
+#   5. Optionally removes compiled build cache (target/ directory).
+#   6. Optionally removes the Rust toolchain (rustup self uninstall).
+#   7. Removes the IPC socket file if it exists.
 #
-# The project source files (stage1/src/) are NOT deleted — only installed
-# system files are removed. Use --remove-build to also wipe target/.
+# The project source files (stage1/src/ and stage2/) are NOT deleted.
 #
 # Usage:
 #   sudo bash scripts/uninstall.sh [OPTIONS]
@@ -38,10 +38,13 @@ CONFIRM=true
 BINARY_NAME="ddos_stage1"
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="ddos-stage1"
+SERVICE2_NAME="ddos-stage2"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SERVICE2_FILE="/etc/systemd/system/${SERVICE2_NAME}.service"
 SOCKET_FILE="/tmp/ddos_stage1.sock"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$(dirname "$SCRIPT_DIR")/stage1/target"
+STAGE2_DIR="$(dirname "$SCRIPT_DIR")/stage2"
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -63,17 +66,19 @@ fi
 
 echo ""
 info "═══════════════════════════════════════════════════════"
-info "  Adaptive DDoS Pre-Filter — Stage 1 Uninstaller      "
+info "  Adaptive DDoS Mitigation — Stage 1 & 2 Uninstaller   "
 info "═══════════════════════════════════════════════════════"
 echo ""
 
 # ── Confirmation prompt ───────────────────────────────────────────────────────
 if $CONFIRM; then
-    warn "This will remove Stage 1 from your system."
+    warn "This will remove Stage 1 & 2 from your system."
     warn "The following will be deleted:"
     warn "  • $INSTALL_DIR/$BINARY_NAME"
     warn "  • $SERVICE_FILE (if present)"
+    warn "  • $SERVICE2_FILE (if present)"
     warn "  • $SOCKET_FILE (if present)"
+    warn "  • $STAGE2_DIR/venv (Python virtual environment)"
     $REMOVE_BUILD && warn "  • $BUILD_DIR (build cache)"
     $REMOVE_RUST  && warn "  • Rust toolchain (~/.cargo and ~/.rustup)"
     echo ""
@@ -82,35 +87,40 @@ if $CONFIRM; then
 fi
 
 # =============================================================================
-# STEP 1 — Stop and disable the systemd service
+# STEP 1 — Stop and disable systemd services
 # =============================================================================
 if command -v systemctl &>/dev/null; then
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        info "Stopping $SERVICE_NAME..."
-        systemctl stop "$SERVICE_NAME"
-        success "$SERVICE_NAME stopped."
-    fi
-
-    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-        info "Disabling $SERVICE_NAME..."
-        systemctl disable "$SERVICE_NAME"
-        success "$SERVICE_NAME disabled."
-    fi
+    for svc in "$SERVICE_NAME" "$SERVICE2_NAME"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            info "Stopping $svc..."
+            systemctl stop "$svc"
+            success "$svc stopped."
+        fi
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            info "Disabling $svc..."
+            systemctl disable "$svc"
+            success "$svc disabled."
+        fi
+    done
 else
     info "systemctl not found; skipping service stop."
 fi
 
 # =============================================================================
-# STEP 2 — Remove the systemd unit file
+# STEP 2 — Remove systemd unit files
 # =============================================================================
-if [[ -f "$SERVICE_FILE" ]]; then
-    info "Removing systemd unit file: $SERVICE_FILE"
-    rm -f "$SERVICE_FILE"
-    # Reload systemd so it forgets about the removed unit.
-    command -v systemctl &>/dev/null && systemctl daemon-reload
-    success "Unit file removed."
-else
-    info "No systemd unit file found at $SERVICE_FILE (skipping)."
+RELOAD_NEEDED=false
+for svc_file in "$SERVICE_FILE" "$SERVICE2_FILE"; do
+    if [[ -f "$svc_file" ]]; then
+        info "Removing systemd unit file: $svc_file"
+        rm -f "$svc_file"
+        RELOAD_NEEDED=true
+        success "Unit file $(basename "$svc_file") removed."
+    fi
+done
+
+if $RELOAD_NEEDED && command -v systemctl &>/dev/null; then
+    systemctl daemon-reload
 fi
 
 # =============================================================================
@@ -133,6 +143,15 @@ if [[ -S "$SOCKET_FILE" ]] || [[ -f "$SOCKET_FILE" ]]; then
     info "Removing IPC socket: $SOCKET_FILE"
     rm -f "$SOCKET_FILE"
     success "Socket file removed."
+fi
+
+# =============================================================================
+# STEP 4.5 — Remove Stage 2 Python Virtual Environment
+# =============================================================================
+if [[ -d "$STAGE2_DIR/venv" ]]; then
+    info "Removing Stage 2 Python virtual environment..."
+    rm -rf "$STAGE2_DIR/venv"
+    success "Python virtual environment removed."
 fi
 
 # =============================================================================
@@ -167,10 +186,10 @@ else
 fi
 
 echo ""
-success "════════════════════════════════════════════"
-success " Stage 1 has been uninstalled successfully "
-success "════════════════════════════════════════════"
+success "═══════════════════════════════════════════════"
+success " Stage 1 & 2 have been uninstalled successfully "
+success "═══════════════════════════════════════════════"
 echo ""
-info "Source files in stage1/src/ have NOT been deleted."
+info "Source files in stage1/src/ and stage2/ have NOT been deleted."
 info "Re-install at any time with: sudo bash scripts/install.sh"
 echo ""

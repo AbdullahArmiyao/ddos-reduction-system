@@ -146,6 +146,11 @@ impl EwmaState {
         self.value
     }
 
+    /// Update the EWMA rate directly with a pre-calculated rate sample.
+    pub fn update_rate(&mut self, rate: f64) {
+        self.value = self.alpha * rate + (1.0 - self.alpha) * self.value;
+    }
+
     /// Expose the current alpha for logging / debugging.
     pub fn alpha(&self) -> f64 {
         self.alpha

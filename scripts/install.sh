@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — Stage 1 Installation Script (Linux/macOS)
+# install.sh — Stage 1 & 2 Installation Script (Linux/macOS)
 # =============================================================================
 #
 # Supports:
@@ -71,7 +71,7 @@ fi
 
 echo ""
 info "═══════════════════════════════════════════════════════"
-info "  Adaptive DDoS Pre-Filter — Stage 1 Installer        "
+info "  Adaptive DDoS Mitigation — Stage 1 & 2 Installer     "
 info "═══════════════════════════════════════════════════════"
 echo ""
 
@@ -111,11 +111,16 @@ install_deps_apt() {
     # libpcap-dev  : headers and static lib for pcap crate
     # build-essential : gcc, make, linker
     # pkg-config   : lets Cargo find libpcap via pkg-config
+    # python3, python3-pip, python3-venv, ipset : for Stage 2
     apt-get install -y --no-install-recommends \
         libpcap-dev \
         build-essential \
         pkg-config \
-        curl
+        curl \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ipset
 }
 
 install_deps_dnf() {
@@ -124,7 +129,10 @@ install_deps_dnf() {
         libpcap-devel \
         gcc \
         pkg-config \
-        curl
+        curl \
+        python3 \
+        python3-pip \
+        ipset
 }
 
 install_deps_yum() {
@@ -132,17 +140,28 @@ install_deps_yum() {
         libpcap-devel \
         gcc \
         pkgconfig \
-        curl
+        curl \
+        python3 \
+        python3-pip \
+        ipset
 }
 
 install_deps_apk() {
     # Alpine uses musl libc; libpcap-dev provides headers
+    # py3-* packages avoid compilation of heavy libraries
     apk add --no-cache \
         libpcap-dev \
         build-base \
         pkgconfig \
         curl \
-        bash
+        bash \
+        python3 \
+        py3-pip \
+        ipset \
+        py3-pandas \
+        py3-numpy \
+        py3-scikit-learn \
+        py3-joblib
 }
 
 case "$PKG_MANAGER" in
@@ -212,10 +231,34 @@ else
 fi
 
 # =============================================================================
-# STEP 6 — Install systemd service unit (optional, Linux only)
+# STEP 5.5 — Setup Stage 2 Python Virtual Environment
+# =============================================================================
+info "Setting up Stage 2 Python virtual environment..."
+STAGE2_DIR="$(dirname "$PROJECT_DIR")/stage2"
+if [[ -d "$STAGE2_DIR" ]]; then
+    if ! command -v python3 &>/dev/null; then
+        error "python3 is not installed."
+    fi
+    info "Creating virtual environment at $STAGE2_DIR/venv..."
+    if [[ "$PKG_MANAGER" == "apk" ]]; then
+        python3 -m venv --system-site-packages "$STAGE2_DIR/venv"
+    else
+        python3 -m venv "$STAGE2_DIR/venv"
+    fi
+    
+    info "Installing dependencies from requirements.txt..."
+    "$STAGE2_DIR/venv/bin/pip" install --upgrade pip
+    "$STAGE2_DIR/venv/bin/pip" install -r "$STAGE2_DIR/requirements.txt"
+    success "Stage 2 Python environment setup complete."
+else
+    warn "Stage 2 directory not found at $STAGE2_DIR. Skipping."
+fi
+
+# =============================================================================
+# STEP 6 — Install systemd service units (optional, Linux only)
 # =============================================================================
 if $INSTALL_SERVICE && command -v systemctl &>/dev/null; then
-    info "Installing systemd service unit..."
+    info "Installing systemd service units..."
 
     # Build the ExecStart command line.
     EXEC_START="$INSTALL_DIR/$BINARY_NAME --interface $INTERFACE"
@@ -235,29 +278,18 @@ if $INSTALL_SERVICE && command -v systemctl &>/dev/null; then
 [Unit]
 Description=Adaptive DDoS Pre-Filter Stage 1 (Rust)
 Documentation=https://github.com/your-repo/ddos-reduction
-# Start after the network bridge (br0) is fully up.
-After=network-online.target
+# Start after network is up and Stage 2 classification engine is running
+After=network-online.target ddos-stage2.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-
-# The binary has CAP_NET_RAW set via setcap, so it does not need to run as root.
-# If setcap failed during install, change User=root.
 User=root
 Group=root
-
 ExecStart=$EXEC_START
-
-# Restart automatically if the process crashes (not if stopped manually).
 Restart=on-failure
 RestartSec=5s
-
-# Log level. Change to debug for verbose per-window output.
 Environment="RUST_LOG=info"
-
-# Hard limits to protect the host if something goes wrong.
-# MemoryMax=256M caps RSS; LimitNOFILE increases the open-file limit for pcap.
 MemoryMax=256M
 LimitNOFILE=65536
 
@@ -265,13 +297,42 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
+    if [[ -d "$STAGE2_DIR" ]]; then
+        cat > "$SERVICE_DIR/ddos-stage2.service" << EOF
+# =============================================================================
+# ddos-stage2.service — systemd unit for the DDoS mitigation Stage 2 daemon
+# Generated by install.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+# =============================================================================
+
+[Unit]
+Description=Adaptive DDoS Mitigation Stage 2 Classifier (Python)
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=$STAGE2_DIR
+ExecStart=$STAGE2_DIR/venv/bin/python stage2.py
+Restart=on-failure
+RestartSec=5s
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        success "Systemd service file created for Stage 2."
+    fi
+
     systemctl daemon-reload
-    success "Systemd service installed: ddos-stage1.service"
+    success "Systemd services installed: ddos-stage1.service, ddos-stage2.service"
     info ""
     info "To enable at boot and start now:"
+    info "    systemctl enable --now ddos-stage2"
     info "    systemctl enable --now ddos-stage1"
     info ""
     info "To check logs:"
+    info "    journalctl -u ddos-stage2 -f"
     info "    journalctl -u ddos-stage1 -f"
 else
     if $INSTALL_SERVICE; then
@@ -284,7 +345,7 @@ fi
 # =============================================================================
 echo ""
 success "════════════════════════════════════════════"
-success " Stage 1 installation complete!            "
+success " Stage 1 & 2 installation complete!         "
 success "════════════════════════════════════════════"
 echo ""
 info "Quick start:"

@@ -55,7 +55,7 @@
 
 use crate::{
     capture::{PacketMeta, Protocol},
-    entropy::EntropyAccumulator,
+    entropy::{EntropyAccumulator, WINDOW_SIZE},
     ewma::EwmaState,
     ipc::{FeatureVector, IpcSocket, FLAG_ENTROPY_ANOMALY, FLAG_RATE_ANOMALY},
     welford::WelfordAccumulator,
@@ -63,8 +63,9 @@ use crate::{
 use crossbeam_channel::Receiver;
 use log::{info, warn};
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 
 // -----------------------------------------------------------------------------
 // AnalysisConfig
@@ -82,6 +83,12 @@ pub struct AnalysisConfig {
     pub socket_path: String,
     /// Victim IP string — logged at startup for operator confirmation.
     pub victim_ip: String,
+    /// If Some, write every post-warmup feature vector to this CSV file.
+    /// The file is created (or appended) at thread start.
+    pub train_csv: Option<String>,
+    /// Integer class label written into every CSV row.
+    /// 0 = normal, 1 = flash_crowd, 2 = ddos
+    pub train_label: u8,
 }
 
 impl Default for AnalysisConfig {
@@ -91,6 +98,8 @@ impl Default for AnalysisConfig {
             ewma_alpha:  crate::ewma::DEFAULT_ALPHA,
             socket_path: crate::ipc::SOCKET_PATH.to_string(),
             victim_ip:   String::from("(not set)"),
+            train_csv:   None,
+            train_label: 0,
         }
     }
 }
@@ -115,8 +124,31 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     );
 
     // -------------------------------------------------------------------------
-    // Initialise all per-session state objects.
+    // Open the CSV training file if --train-csv was passed.
     // -------------------------------------------------------------------------
+    let mut csv_writer: Option<std::fs::File> = if let Some(ref path) = cfg.train_csv {
+        let file_exists = std::path::Path::new(path).exists();
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(mut f) => {
+                if !file_exists {
+                    // Write CSV header only if the file is new.
+                    let _ = writeln!(
+                        f,
+                        "entropy,ewma_rate,mean_h,mean_r,sigma_h,sigma_r,\
+                         proto_ratio,dominant_ip_ratio,timestamp,label"
+                    );
+                }
+                info!("Analysis: training mode ON — writing CSV to '{}' with label={}", path, cfg.train_label);
+                Some(f)
+            }
+            Err(e) => {
+                warn!("Analysis: failed to open train-csv '{}': {e} — training disabled", path);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Layer 1 state — updated on every incoming packet.
     let mut ewma    = EwmaState::with_alpha(cfg.ewma_alpha);
@@ -143,6 +175,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     // *after* entropy is computed (before the accumulator resets it).
     let mut ip_counts: HashMap<IpAddr, u32> = HashMap::new();
     let mut window_packet_count: usize = 0;
+    let mut last_window_close = Instant::now();
 
     // -------------------------------------------------------------------------
     // Main loop — one iteration per packet received from the capture thread.
@@ -151,10 +184,6 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         // =====================================================================
         // LAYER 1 — Per-Packet Updates
         // =====================================================================
-
-        // Update the EWMA rate estimator with this packet's arrival timestamp.
-        // This call is on the hot path and must stay O(1).
-        ewma.update(meta.arrived_at);
 
         // Increment this IP's frequency count for the current window.
         // EntropyAccumulator maintains its own internal counts; ip_counts is
@@ -181,6 +210,19 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
 
         window_id += 1;
 
+        // Calculate window duration and update the EWMA rate once per window.
+        // This eliminates timing jitter spikes from microsecond packet spacing.
+        let now_instant = Instant::now();
+        let window_duration = now_instant.duration_since(last_window_close).as_secs_f64();
+        last_window_close = now_instant;
+
+        let window_rate = if window_duration > 0.0 {
+            WINDOW_SIZE as f64 / window_duration
+        } else {
+            0.0
+        };
+        ewma.update_rate(window_rate);
+
         // Compute Shannon Entropy scalar h from the current window's IP distribution.
         // This call clears the internal HashMap and resets the packet counter.
         let h = entropy.compute_and_reset();
@@ -189,8 +231,11 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         // The EWMA itself is NOT reset — it retains cross-window memory.
         let r = ewma.snapshot();
 
-        // Compute the dominant-IP ratio: fraction of packets from the busiest IP.
-        let dominant_count = ip_counts.values().copied().max().unwrap_or(0);
+        // Compute the dominant-IP ratio: fraction of packets from the busiest IP, and retrieve that IP.
+        let (dominant_ip, dominant_count) = ip_counts.iter()
+            .map(|(ip, count)| (*ip, *count))
+            .max_by_key(|(_, count)| *count)
+            .unwrap_or((std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0));
         let dominant_ip_ratio = dominant_count as f64 / window_packet_count as f64;
 
         // Compute proto_ratio: fraction of window packets that were TCP.
@@ -265,9 +310,9 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         if anomaly_flags != 0 {
             warn!(
                 "ANOMALY window {} | flags={:#04x} | r={:.1} (boundary={:.1}) | \
-                 h={:.4} (boundary={:.4}) | proto_ratio={:.3} | dom_ratio={:.3}",
+                 h={:.4} (boundary={:.4}) | proto_ratio={:.3} | dom_ratio={:.3} | dominant_ip={}",
                 window_id, anomaly_flags, r, rate_boundary, h, entropy_boundary,
-                proto_ratio, dominant_ip_ratio
+                proto_ratio, dominant_ip_ratio, dominant_ip
             );
 
             let fv = FeatureVector {
@@ -280,6 +325,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 proto_ratio,
                 dominant_ip_ratio,
                 timestamp,
+                dominant_ip,
             };
 
             // Attempt to send to Stage 2. If the socket is not connected yet
@@ -292,6 +338,22 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         } else {
             // Normal window — no anomaly. Log at debug level only.
             log::debug!("Window #{window_id}: NORMAL | r={r:.1} | h={h:.4}");
+        }
+
+        // =====================================================================
+        // Training mode: append this window to the CSV regardless of anomaly.
+        // =====================================================================
+        if let Some(ref mut f) = csv_writer {
+            let _ = writeln!(
+                f,
+                "{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.3},{}",
+                h, r,
+                welford_entropy.mean, welford_rate.mean,
+                welford_entropy.std_dev(), welford_rate.std_dev(),
+                proto_ratio, dominant_ip_ratio,
+                timestamp,
+                cfg.train_label
+            );
         }
     }
 

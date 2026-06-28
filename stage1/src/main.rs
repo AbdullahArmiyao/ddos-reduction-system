@@ -83,6 +83,10 @@ struct CliArgs {
     socket:    String,
     no_filter: bool,
     log_file:  Option<String>,
+    /// If set, write every post-warmup feature vector to this CSV file.
+    train_csv: Option<String>,
+    /// Integer class label written into the CSV (0=normal, 1=flash_crowd, 2=ddos).
+    train_label: u8,
 }
 
 impl CliArgs {
@@ -93,9 +97,11 @@ impl CliArgs {
         let mut victim_ip: Option<String> = None;
         let mut k         = 2.0_f64;
         let mut alpha     = ewma::DEFAULT_ALPHA;
-        let mut socket    = ipc::SOCKET_PATH.to_string();
-        let mut no_filter = false;
-        let mut log_file: Option<String> = None;
+        let mut socket      = ipc::SOCKET_PATH.to_string();
+        let mut no_filter   = false;
+        let mut log_file:   Option<String> = None;
+        let mut train_csv:  Option<String> = None;
+        let mut train_label: u8 = 0;
 
         let mut i = 1;
         while i < args.len() {
@@ -131,6 +137,16 @@ impl CliArgs {
                     i += 1;
                     log_file = args.get(i).cloned();
                 }
+                "--train-csv" => {
+                    i += 1;
+                    train_csv = args.get(i).cloned();
+                }
+                "--label" => {
+                    i += 1;
+                    train_label = args.get(i)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                }
                 "--help" | "-h" => {
                     print_usage(&args[0]);
                     process::exit(0);
@@ -151,7 +167,7 @@ impl CliArgs {
             process::exit(1);
         }
 
-        Self { interface, victim_ip, k, alpha, socket, no_filter, log_file }
+        Self { interface, victim_ip, k, alpha, socket, no_filter, log_file, train_csv, train_label }
     }
 }
 
@@ -167,6 +183,8 @@ fn print_usage(bin: &str) {
     eprintln!("  --socket     <PATH>    IPC socket path       [default: /tmp/ddos_stage1.sock]");
     eprintln!("  --no-filter            Disable BPF filter (dev/test only)");
     eprintln!("  --log-file   <PATH>    Path to write logs to in addition to terminal");
+    eprintln!("  --train-csv  <PATH>    Write ALL post-warmup feature vectors to CSV (training mode)");
+    eprintln!("  --label      <INT>     Class label for training CSV rows (0=normal, 1=flash_crowd, 2=ddos)");
     eprintln!("  --help, -h             Show this message");
     eprintln!();
     eprintln!("Environment:");
@@ -258,6 +276,8 @@ fn main() {
         ewma_alpha:  args.alpha,
         socket_path: args.socket.clone(),
         victim_ip:   args.victim_ip.clone().unwrap_or_default(),
+        train_csv:   args.train_csv.clone(),
+        train_label: args.train_label,
     };
 
     // -------------------------------------------------------------------------
