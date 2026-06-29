@@ -332,13 +332,14 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         let raw_sigma_r = welford_rate.std_dev();
         let raw_sigma_h = welford_entropy.std_dev();
 
-        // 1. Sigma Ceiling: Cap the standard deviation to prevent the boundaries from drifting too wide.
-        // Cap rate standard deviation at 10000.0 pps or 20% of the mean (whichever is larger).
+        // 1. Sigma Ceiling & Floor: Cap the standard deviation to prevent the boundaries from drifting too wide,
+        // but also enforce a floor to prevent zero-baseline lockout.
+        // Cap rate standard deviation at 10000.0 pps or 20% of the mean (whichever is larger), floor at 50.0.
         let ceiling_r = (0.2 * welford_rate.mean).max(10000.0);
-        let sigma_r = raw_sigma_r.min(ceiling_r);
+        let sigma_r = raw_sigma_r.max(50.0).min(ceiling_r);
 
-        // Cap entropy standard deviation at 0.5 bits.
-        let sigma_h = raw_sigma_h.min(0.5);
+        // Cap entropy standard deviation at 0.5 bits, floor at 0.05 bits.
+        let sigma_h = raw_sigma_h.max(0.05).min(0.5);
 
         // 2. High-Sensitivity Cooldown Mode: If we are within the cooldown recovery window,
         // reduce the anomaly threshold multiplier k to increase sensitivity to subsequent attack pulses.

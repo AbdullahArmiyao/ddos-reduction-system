@@ -360,10 +360,10 @@ def run_ipc_receiver():
                     pred_class = int(clf.predict(features_df)[0])
 
                 # Safety overrides
-                if pred_class == 0 and ewma_rate > 2000.0:
+                if pred_class in (0, 1) and ewma_rate > 2000.0:
                     if ewma_rate > 10000.0:
                         pred_class = 2
-                    elif entropy < 3.5 or dominant_ip_ratio > 0.25:
+                    elif entropy < 3.5 or dominant_ip_ratio > 0.75:
                         pred_class = 2
                     else:
                         pred_class = 1
