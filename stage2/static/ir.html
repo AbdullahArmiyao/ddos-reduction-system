@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - INCIDENT RESPONSE</title>
+    <link rel="stylesheet" href="/static/base.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .export-actions {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+        .export-card {
+            flex: 1;
+            background-color: var(--bg-surface);
+            border: var(--grid-border);
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            position: relative;
+        }
+        .export-card::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 8px;
+            height: 8px;
+            border-top: 2px solid var(--accent-cyan);
+            border-left: 2px solid var(--accent-cyan);
+        }
+        .export-title {
+            font-size: 1rem;
+            font-weight: bold;
+            color: var(--accent-cyan);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .export-desc {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+            line-height: 1.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">S</div>
+            <div class="logo-text">SHIELD</div>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item"><a href="/"><span>■</span> Dashboard</a></li>
+            <li class="nav-item"><a href="/active-ips.html"><span>■</span> Active Flows</a></li>
+            <li class="nav-item"><a href="/interfaces.html"><span>■</span> Interfaces</a></li>
+            <li class="nav-item"><a href="/firewall.html"><span>■</span> Firewall</a></li>
+            <li class="nav-item"><a href="/targets.html"><span>■</span> Targets</a></li>
+            <li class="nav-item"><a href="/logs.html"><span>■</span> Event Log</a></li>
+            <li class="nav-item active"><a href="/ir.html"><span>■</span> Incident Response</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            GATEWAY CONSOLE v1.0.0
+        </div>
+    </div>
+
+    <div class="main-panel">
+        <div class="top-bar">
+            <div class="top-bar-title">
+                <h1>IR_CORE // COUNTERMEASURE ACTIONS & AUDITING</h1>
+            </div>
+        </div>
+
+        <div class="content-area">
+            <!-- Export Cards Row -->
+            <div class="export-actions">
+                <!-- CSV Card -->
+                <div class="export-card">
+                    <div class="export-title">Export Raw Logs (CSV)</div>
+                    <div class="export-desc">
+                        Downloads the entire SQLite audit ledger in comma-separated values format. 
+                        Suitable for ingestion into corporate SIEM platforms (Splunk, ELK) or spreadsheet analysis.
+                    </div>
+                    <button class="btn" style="width: 100%; margin-top: auto;" onclick="downloadCsv()">DOWNLOAD RAW LEDGER (.CSV)</button>
+                </div>
+
+                <!-- PDF Card -->
+                <div class="export-card">
+                    <div class="export-title">Export Incident Report (PDF)</div>
+                    <div class="export-desc">
+                        Generates an executive-level summary report of the gateway's performance.
+                        Includes current network baselines, active blocklist statistics, and embeds the live PPS/Entropy timeline charts below.
+                    </div>
+                    <button class="btn btn-danger" style="width: 100%; margin-top: auto;" onclick="generatePdfReport()">COMPILE EXECUTIVE REPORT (.PDF)</button>
+                </div>
+            </div>
+
+            <!-- Preview Charts (Rendered for PDF extraction) -->
+            <div class="hud-panel">
+                <div class="hud-panel-header">
+                    <div class="hud-panel-title">TIMELINE PREVIEW FOR COMPILATION EXPORT</div>
+                    <span class="badge badge-normal">INCIDENT RESOLUTION GRAPHICS</span>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                    <div style="height: 250px; position: relative;">
+                        <canvas id="pdfRateCanvas"></canvas>
+                    </div>
+                    <div style="height: 250px; position: relative;">
+                        <canvas id="pdfEntropyCanvas"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Setup Chart.js defaults
+        Chart.defaults.color = '#5c7b80';
+        Chart.defaults.font.family = "'JetBrains Mono', monospace";
+        Chart.defaults.font.size = 10;
+
+        let rateChart = null;
+        let entropyChart = null;
+
+        async function initPreviewCharts() {
+            try {
+                const res = await fetch('/api/history');
+                const history = await res.json();
+                
+                const labels = history.map(h => new Date(h.timestamp * 1000).toISOString().split('T')[1].substring(0, 8));
+                const rates = history.map(h => h.ewma_rate);
+                const boundariesR = history.map(h => h.mean_r + (h.k_multiplier * h.sigma_r));
+                const entropies = history.map(h => h.entropy);
+                const boundariesH = history.map(h => h.mean_h - (h.k_multiplier * h.sigma_h));
+
+                const rateCtx = document.getElementById('pdfRateCanvas').getContext('2d');
+                rateChart = new Chart(rateCtx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: 'EWMA Rate (r)',
+                                data: rates,
+                                borderColor: '#00f0ff',
+                                borderWidth: 1.5,
+                                pointRadius: 1,
+                                fill: false
+                            },
+                            {
+                                label: 'Welford Upper Limit',
+                                data: boundariesR,
+                                borderColor: '#ff3b30',
+                                borderWidth: 1,
+                                borderDash: [4, 4],
+                                pointRadius: 0,
+                                fill: false
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: 'top' } }
+                    }
+                });
+
+                const entropyCtx = document.getElementById('pdfEntropyCanvas').getContext('2d');
+                entropyChart = new Chart(entropyCtx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [
+                            {
+                                label: 'Entropy (h)',
+                                data: entropies,
+                                borderColor: '#00f0ff',
+                                borderWidth: 1.5,
+                                pointRadius: 1,
+                                fill: false
+                            },
+                            {
+                                label: 'Welford Lower Limit',
+                                data: boundariesH,
+                                borderColor: '#ff3b30',
+                                borderWidth: 1,
+                                borderDash: [4, 4],
+                                pointRadius: 0,
+                                fill: false
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: 'top' } }
+                    }
+                });
+
+            } catch (err) {
+                console.error("Failed to load historical charts:", err);
+            }
+        }
+
+        function downloadCsv() {
+            window.location.href = '/api/logs/export/csv';
+        }
+
+        async function generatePdfReport() {
+            if (!rateChart || !entropyChart) {
+                alert("Charts not yet populated. Please wait.");
+                return;
+            }
+
+            // Extract base64 image strings from chart canvases
+            const rateImg = rateChart.toBase64Image();
+            const entropyImg = entropyChart.toBase64Image();
+
+            try {
+                const response = await fetch('/api/logs/export/pdf', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        rate_chart_base64: rateImg,
+                        entropy_chart_base64: entropyImg
+                    })
+                });
+
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `SHIELD_GATEWAY_REPORT_${new Date().toISOString().split('T')[0]}.pdf`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                } else {
+                    alert("Failed to generate PDF Report.");
+                }
+            } catch (err) {
+                console.error("PDF generation failed:", err);
+                alert("An error occurred during report compilation.");
+            }
+        }
+
+        initPreviewCharts();
+    </script>
+</body>
+</html>

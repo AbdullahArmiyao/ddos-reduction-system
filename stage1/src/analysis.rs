@@ -178,6 +178,11 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     let mut last_window_close = Instant::now();
     let mut cooldown_counter: usize = 0;
 
+    // Active IP and port flow counters for Web UI telemetry.
+    let mut flow_counts: HashMap<(IpAddr, u16, u8), u32> = HashMap::new();
+    let mut last_flow_write = Instant::now();
+    let mut last_sent_time = 0.0;
+
     // -------------------------------------------------------------------------
     // Main loop — one iteration per packet received from the capture thread.
     // -------------------------------------------------------------------------
@@ -192,6 +197,15 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         entropy.add_packet(meta.src_ip);
         *ip_counts.entry(meta.src_ip).or_insert(0) += 1;
         window_packet_count += 1;
+
+        // Track specific flow for web telemetry
+        let proto_num = match meta.protocol {
+            Protocol::Tcp => 6,
+            Protocol::Udp => 17,
+            Protocol::Icmp => 1,
+            Protocol::Other => 0,
+        };
+        *flow_counts.entry((meta.src_ip, meta.dst_port, proto_num)).or_insert(0) += 1;
 
         // Increment the Layer 4 protocol counter for the current window.
         match meta.protocol {
@@ -264,6 +278,13 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             .unwrap_or_default()
             .as_secs_f64();
 
+        // Write active flows periodically to JSON for dashboard (every 10s)
+        if now_instant.duration_since(last_flow_write).as_secs_f64() >= 10.0 {
+            write_active_flows(&flow_counts, timestamp);
+            flow_counts.clear();
+            last_flow_write = now_instant;
+        }
+
         // Reset all per-window accumulators for the next window.
         ip_counts.clear();
         window_packet_count = 0;
@@ -286,6 +307,24 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 "Analysis: warm-up window {}/{} | r={r:.1} pps | h={h:.3} bits",
                 welford_rate.n, crate::welford::WARMUP_WINDOWS
             );
+
+            // Send warmup telemetry updates so that the dashboard updates immediately!
+            let fv = FeatureVector {
+                entropy:     h,
+                ewma_rate:   r,
+                mean_h:      welford_entropy.mean,
+                mean_r:      welford_rate.mean,
+                sigma_h:     welford_entropy.std_dev(),
+                sigma_r:     welford_rate.std_dev(),
+                proto_ratio,
+                dominant_ip_ratio,
+                timestamp,
+                dominant_ip: IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), // No dominant IP during warmup
+            };
+            if !ipc.send(&fv) {
+                warn!("Analysis: IPC send failed during warm-up; Stage 2 may be offline");
+            }
+
             continue;
         }
 
@@ -352,16 +391,19 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             cooldown_counter
         );
 
-        // =====================================================================
-        // Signal Stage 2 if any anomaly was detected.
-        // =====================================================================
-        if anomaly_flags != 0 {
-            warn!(
-                "ANOMALY window {} | flags={:#04x} | r={:.1} (boundary={:.1}) | \
-                 h={:.4} (boundary={:.4}) | proto_ratio={:.3} | dom_ratio={:.3} | dominant_ip={}",
-                window_id, anomaly_flags, r, rate_boundary, h, entropy_boundary,
-                proto_ratio, dominant_ip_ratio, dominant_ip
-            );
+        // Signal Stage 2 if an anomaly was detected OR if 10 seconds elapsed (heartbeat telemetry)
+        let is_heartbeat = (timestamp - last_sent_time) >= 10.0;
+        if anomaly_flags != 0 || is_heartbeat {
+            if anomaly_flags != 0 {
+                warn!(
+                    "ANOMALY window {} | flags={:#04x} | r={:.1} (boundary={:.1}) | \
+                     h={:.4} (boundary={:.4}) | proto_ratio={:.3} | dom_ratio={:.3} | dominant_ip={}",
+                    window_id, anomaly_flags, r, rate_boundary, h, entropy_boundary,
+                    proto_ratio, dominant_ip_ratio, dominant_ip
+                );
+            } else {
+                log::debug!("Window #{window_id}: HEARTBEAT | r={r:.1} | h={h:.4}");
+            }
 
             let fv = FeatureVector {
                 entropy:     h,
@@ -376,15 +418,13 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 dominant_ip,
             };
 
-            // Attempt to send to Stage 2. If the socket is not connected yet
-            // (Python not yet ready) IpcSocket will log and return false.
-            // We do NOT block the analysis loop waiting for IPC — the gateway
-            // must keep capturing even if Stage 2 is temporarily unavailable.
-            if !ipc.send(&fv) {
+            if ipc.send(&fv) {
+                last_sent_time = timestamp;
+            } else {
                 warn!("Analysis: IPC send failed for window #{window_id}; Stage 2 may be offline");
             }
         } else {
-            // Normal window — no anomaly. Log at debug level only.
+            // Normal window — no anomaly, no heartbeat. Log at debug level only.
             log::debug!("Window #{window_id}: NORMAL | r={r:.1} | h={h:.4}");
         }
 
@@ -409,4 +449,55 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     // The rx channel has closed — the capture thread has exited.
     // -------------------------------------------------------------------------
     info!("Analysis: channel closed; processed {window_id} windows total. Exiting.");
+}
+
+/// Helper function to write top 20 active network flows atomically to /tmp/ddos_active_flows.json
+fn write_active_flows(flow_counts: &HashMap<(IpAddr, u16, u8), u32>, timestamp: f64) {
+    // Sort flows by packet count descending
+    let mut flows: Vec<_> = flow_counts.iter().collect();
+    flows.sort_by(|a, b| b.1.cmp(a.1));
+    
+    // Take top 20 active flows to prevent massive files
+    let top_flows = flows.into_iter().take(20);
+    
+    let mut json = String::new();
+    json.push_str("{\n  \"timestamp\": ");
+    json.push_str(&timestamp.to_string());
+    json.push_str(",\n  \"active_ips\": [\n");
+    
+    let mut first = true;
+    for (key, count_ref) in top_flows {
+        let (ip, port, proto) = *key;
+        let count = *count_ref;
+        if !first {
+            json.push_str(",\n");
+        }
+        first = false;
+        
+        let proto_str = match proto {
+            6 => "TCP",
+            17 => "UDP",
+            1 => "ICMP",
+            _ => "OTHER",
+        };
+        
+        // Calculate rate over 10 seconds (count / 10.0)
+        let rate = count as f64 / 10.0;
+        
+        json.push_str(&format!(
+            "    {{\"ip\": \"{}\", \"port\": {}, \"proto\": \"{}\", \"rate\": {:.1}}}",
+            ip, port, proto_str, rate
+        ));
+    }
+    json.push_str("\n  ]\n}");
+    
+    // Write atomically
+    let tmp_path = "/tmp/ddos_active_flows.tmp";
+    let final_path = "/tmp/ddos_active_flows.json";
+    if let Ok(mut file) = std::fs::File::create(tmp_path) {
+        use std::io::Write;
+        if file.write_all(json.as_bytes()).is_ok() {
+            let _ = std::fs::rename(tmp_path, final_path);
+        }
+    }
 }

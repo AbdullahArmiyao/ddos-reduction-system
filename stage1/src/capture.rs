@@ -102,6 +102,8 @@ pub struct PacketMeta {
     pub arrived_at: Instant,
     /// Layer 4 protocol — used by the analysis thread to build proto_ratio.
     pub protocol: Protocol,
+    /// Destination port number extracted from L4 transport header (0 if not applicable).
+    pub dst_port: u16,
 }
 
 // -----------------------------------------------------------------------------
@@ -308,17 +310,12 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
             _ => continue,
         };
 
-        // -------------------------------------------------------------------------
-        // Step 5b: Identify the Layer 4 protocol from the transport header.
-        // etherparse already parsed the transport slice alongside the IP header,
-        // so this match is zero-cost — no extra parsing needed.
-        // -------------------------------------------------------------------------
-        let protocol = match sliced.transport {
-            Some(TransportSlice::Tcp(_))          => Protocol::Tcp,
-            Some(TransportSlice::Udp(_))          => Protocol::Udp,
-            Some(TransportSlice::Icmpv4(_))       => Protocol::Icmp,
-            Some(TransportSlice::Icmpv6(_))       => Protocol::Icmp,
-            _                                     => Protocol::Other,
+        let (protocol, dst_port) = match sliced.transport {
+            Some(TransportSlice::Tcp(ref slice)) => (Protocol::Tcp, slice.destination_port()),
+            Some(TransportSlice::Udp(ref slice)) => (Protocol::Udp, slice.destination_port()),
+            Some(TransportSlice::Icmpv4(_))       => (Protocol::Icmp, 0),
+            Some(TransportSlice::Icmpv6(_))       => (Protocol::Icmp, 0),
+            _                                     => (Protocol::Other, 0),
         };
 
         packet_count += 1;
@@ -326,7 +323,7 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
         // -------------------------------------------------------------------------
         // Step 6: Forward metadata to the analysis thread via the bounded channel.
         // -------------------------------------------------------------------------
-        let meta = PacketMeta { src_ip, arrived_at, protocol };
+        let meta = PacketMeta { src_ip, arrived_at, protocol, dst_port };
 
         // `send()` blocks if the channel is full (backpressure).  This is the
         // correct behaviour — it prevents unbounded memory growth under flood.

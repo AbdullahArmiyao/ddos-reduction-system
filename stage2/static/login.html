@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - AUTHENTICATION REQUIRED</title>
+    <link rel="stylesheet" href="/static/base.css">
+    <style>
+        body {
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            background-color: #030508;
+        }
+        .login-box {
+            width: 420px;
+            background: #080c12;
+            border: 1px solid var(--accent-cyan-dim);
+            padding: 30px;
+            position: relative;
+            box-shadow: 0 0 15px rgba(0, 240, 255, 0.05);
+        }
+        .login-box::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 12px;
+            height: 12px;
+            border-top: 2px solid var(--accent-cyan);
+            border-left: 2px solid var(--accent-cyan);
+        }
+        .login-box::after {
+            content: "";
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            width: 12px;
+            height: 12px;
+            border-bottom: 2px solid var(--accent-cyan);
+            border-right: 2px solid var(--accent-cyan);
+        }
+        .login-header {
+            text-align: center;
+            margin-bottom: 24px;
+        }
+        .login-logo {
+            width: 48px;
+            height: 48px;
+            border: 1px solid var(--accent-cyan);
+            color: var(--accent-cyan);
+            font-size: 1.5rem;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 12px auto;
+            text-shadow: 0 0 4px var(--accent-cyan);
+            box-shadow: 0 0 6px var(--accent-cyan-glow);
+        }
+        .login-title {
+            color: var(--accent-cyan);
+            font-size: 1rem;
+            font-weight: bold;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+        }
+        .login-subtitle {
+            color: var(--text-dim);
+            font-size: 0.7rem;
+            letter-spacing: 1px;
+            margin-top: 6px;
+        }
+        .error-message {
+            color: var(--accent-alert);
+            background-color: rgba(255, 59, 48, 0.08);
+            border: 1px solid var(--border-alert);
+            padding: 10px;
+            font-size: 0.8rem;
+            margin-bottom: 16px;
+            display: none;
+            text-align: center;
+        }
+        .boot-log {
+            font-size: 0.65rem;
+            color: var(--text-dim);
+            height: 80px;
+            overflow-y: hidden;
+            border-top: 1px dashed rgba(0, 162, 176, 0.2);
+            padding-top: 10px;
+            margin-top: 20px;
+            font-family: inherit;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <div class="login-header">
+            <div class="login-logo">S</div>
+            <div class="login-title">SHIELD GATEWAY</div>
+            <div class="login-subtitle">SECURE ACCESS CONTROLS (SESSION LIMIT: 10M)</div>
+        </div>
+
+        <div id="errorBox" class="error-message"></div>
+
+        <form id="loginForm">
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase;">ADMIN IDENTITY</label>
+                <input type="text" id="username" class="form-input" placeholder="USERNAME" required autofocus>
+            </div>
+            <div style="margin-bottom: 20px;">
+                <label style="display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase;">ACCESS DECRYPT-KEY</label>
+                <input type="password" id="password" class="form-input" placeholder="PASSWORD" required>
+            </div>
+            <button type="submit" class="btn" style="width: 100%;">ESTABLISH CONNECTION</button>
+        </form>
+
+        <div class="boot-log" id="bootLog">
+            SECURE LINK KERNEL INITIALISED...<br>
+            LOADED NETFILTER IPSET BLOCKLIST MODULES...<br>
+            AWAITING ROOT CONSOLE SIGNATURE...
+        </div>
+    </div>
+
+    <script>
+        const bootMessages = [
+            "CHECKING FIREWALL BLOCKLIST IPSETS...",
+            "ESTABLISHING SYNC WITH STAGE 1 TELEMETRY SOCKET...",
+            "DB INITIALIZED AT /etc/ddos-gateway/stage2.db...",
+            "AWAITING CONSOLE IDENTIFICATION...",
+        ];
+        let msgIndex = 0;
+        const logEl = document.getElementById("bootLog");
+
+        setInterval(() => {
+            if (msgIndex < bootMessages.length) {
+                logEl.innerHTML += `<br>${bootMessages[msgIndex]}`;
+                logEl.scrollTop = logEl.scrollHeight;
+                msgIndex++;
+            }
+        }, 1500);
+
+        document.getElementById("loginForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const username = document.getElementById("username").value;
+            const password = document.getElementById("password").value;
+            const errBox = document.getElementById("errorBox");
+
+            errBox.style.display = "none";
+
+            try {
+                const response = await fetch("/api/login", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({ username, password })
+                });
+
+                if (response.ok) {
+                    window.location.href = "/";
+                } else {
+                    const data = await response.json();
+                    errBox.innerText = data.detail || "Authentication handshake rejected.";
+                    errBox.style.display = "block";
+                }
+            } catch (err) {
+                errBox.innerText = "Network failure while connecting to gateway API.";
+                errBox.style.display = "block";
+            }
+        });
+    </script>
+</body>
+</html>

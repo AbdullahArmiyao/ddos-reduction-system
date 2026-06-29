@@ -132,6 +132,10 @@ if [[ -d "$STAGE2_DIR" ]]; then
     if [[ -d "$STAGE2_DIR/venv" ]]; then
         "$STAGE2_DIR/venv/bin/pip" install --upgrade pip
         "$STAGE2_DIR/venv/bin/pip" install -r "$STAGE2_DIR/requirements.txt"
+        
+        info "Updating/migrating administrative database..."
+        "$STAGE2_DIR/venv/bin/python" "$STAGE2_DIR/setup_admin.py"
+        
         success "Stage 2 dependencies updated."
     else
         warn "Stage 2 virtual environment not found. Skip pip update."

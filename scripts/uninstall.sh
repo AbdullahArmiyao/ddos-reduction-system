@@ -107,6 +107,30 @@ else
 fi
 
 # =============================================================================
+# Clean up Netfilter ipset / iptables rules
+# =============================================================================
+info "Cleaning up Netfilter rules and ipset list..."
+if command -v iptables &>/dev/null; then
+    iptables -D INPUT -m set --match-set ddos_blocklist src -j DROP 2>/dev/null || true
+    iptables -D FORWARD -m set --match-set ddos_blocklist src -j DROP 2>/dev/null || true
+fi
+if command -v ipset &>/dev/null; then
+    ipset destroy ddos_blocklist 2>/dev/null || true
+fi
+success "Firewall rules and ipsets cleaned."
+
+# =============================================================================
+# Clean up databases and configuration policies
+# =============================================================================
+info "Cleaning up SQLite database and policy files..."
+rm -f "$STAGE2_DIR/stage2.db"
+rm -f "$STAGE2_DIR/whitelist.json"
+rm -f "$STAGE2_DIR/victims.json"
+rm -f "/tmp/ddos_active_flows.json"
+rm -f "/tmp/ddos_active_flows.tmp"
+success "Database and configurations removed."
+
+# =============================================================================
 # STEP 2 — Remove systemd unit files
 # =============================================================================
 RELOAD_NEEDED=false

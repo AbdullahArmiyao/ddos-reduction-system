@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - SYSTEM EVENT LOGS</title>
+    <link rel="stylesheet" href="/static/base.css">
+    <style>
+        .filter-controls {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 20px;
+            align-items: center;
+        }
+        .log-table td {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .text-ddos {
+            color: var(--accent-alert) !important;
+            font-weight: bold;
+        }
+        .text-flash {
+            color: #f59e0b !important;
+            font-weight: bold;
+        }
+        .text-normal {
+            color: var(--text-dim) !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">S</div>
+            <div class="logo-text">SHIELD</div>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item"><a href="/"><span>■</span> Dashboard</a></li>
+            <li class="nav-item"><a href="/active-ips.html"><span>■</span> Active Flows</a></li>
+            <li class="nav-item"><a href="/interfaces.html"><span>■</span> Interfaces</a></li>
+            <li class="nav-item"><a href="/firewall.html"><span>■</span> Firewall</a></li>
+            <li class="nav-item"><a href="/targets.html"><span>■</span> Targets</a></li>
+            <li class="nav-item active"><a href="/logs.html"><span>■</span> Event Log</a></li>
+            <li class="nav-item"><a href="/ir.html"><span>■</span> Incident Response</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            GATEWAY CONSOLE v1.0.0
+        </div>
+    </div>
+
+    <div class="main-panel">
+        <div class="top-bar">
+            <div class="top-bar-title">
+                <h1>SYS_AUDIT_LOG // EVENT CLASSIFIER LEDGER</h1>
+            </div>
+        </div>
+
+        <div class="content-area">
+            <div class="hud-panel">
+                <div class="hud-panel-header">
+                    <div class="hud-panel-title">SYSTEM EVENT LOG RETRIEVAL</div>
+                </div>
+
+                <div class="filter-controls">
+                    <span style="font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase;">CLASSIFICATION FILTER:</span>
+                    <button class="btn btn-filter" onclick="filterLogs('ALL')" id="btn-ALL">ALL EVENTS</button>
+                    <button class="btn btn-filter" onclick="filterLogs('Normal')" id="btn-Normal">NORMAL</button>
+                    <button class="btn btn-filter" onclick="filterLogs('Flash Crowd')" id="btn-Flash">FLASH CROWD</button>
+                    <button class="btn btn-filter" onclick="filterLogs('DDoS')" id="btn-DDoS">DDoS ATTACKS</button>
+                </div>
+                
+                <table class="log-table">
+                    <thead>
+                        <tr>
+                            <th>TIMESTAMP</th>
+                            <th>SOURCE IP</th>
+                            <th>DESTINATION IP</th>
+                            <th>PROTOCOL</th>
+                            <th>PACKET RATE</th>
+                            <th>SHANNON ENTROPY</th>
+                            <th>CLASSIFICATION</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logTableBody">
+                        <tr>
+                            <td colspan="7" style="text-align: center; color: var(--text-dim);">RETRIEVING AUDIT HISTORY...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentFilter = 'ALL';
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch(`/api/logs?classification=${currentFilter}`);
+                if (res.status === 401) {
+                    window.location.href = '/static/login.html';
+                    return;
+                }
+                const logs = await res.json();
+                
+                // Update filter button highlighting
+                document.querySelectorAll('.btn-filter').forEach(b => {
+                    b.style.borderColor = 'var(--accent-cyan-dim)';
+                    b.style.backgroundColor = 'var(--bg-cyan-dark)';
+                    b.style.color = 'var(--accent-cyan-dim)';
+                });
+                const activeBtnId = currentFilter === 'ALL' ? 'btn-ALL' : (currentFilter === 'Flash Crowd' ? 'btn-Flash' : `btn-${currentFilter}`);
+                const activeBtn = document.getElementById(activeBtnId);
+                if (activeBtn) {
+                    activeBtn.style.borderColor = 'var(--accent-cyan)';
+                    activeBtn.style.backgroundColor = 'var(--bg-cyan-dark)';
+                    activeBtn.style.color = 'var(--accent-cyan)';
+                }
+
+                const tableBody = document.getElementById('logTableBody');
+                if (logs.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-dim);">NO EVENT RECORDS FOUND FOR SELECTION.</td></tr>`;
+                    return;
+                }
+
+                let html = '';
+                logs.forEach(l => {
+                    let classStyle = 'text-normal';
+                    let badgeClass = 'badge badge-normal';
+                    
+                    if (l.classification === 'DDoS') {
+                        classStyle = 'text-ddos';
+                        badgeClass = 'badge badge-ddos';
+                    } else if (l.classification === 'Flash Crowd') {
+                        classStyle = 'text-flash';
+                        badgeClass = 'badge badge-flash';
+                    }
+
+                    const dateStr = new Date(l.timestamp * 1000).toISOString().replace('T', ' ').substring(0, 19);
+
+                    html += `<tr class="${classStyle}">
+                        <td>${dateStr}</td>
+                        <td style="color: var(--text-bright); font-weight: bold;">${l.src_ip}</td>
+                        <td>${l.dst_ip || 'MULTIPLE'}</td>
+                        <td>${l.proto || 'MIXED'}</td>
+                        <td>${l.rate.toFixed(1)} pps</td>
+                        <td>${l.entropy.toFixed(4)} bits</td>
+                        <td><span class="${badgeClass}">${l.classification.toUpperCase()}</span></td>
+                    </tr>`;
+                });
+                
+                tableBody.innerHTML = html;
+            } catch (err) {
+                console.error("Failed to load logs:", err);
+            }
+        }
+
+        function filterLogs(filterType) {
+            currentFilter = filterType;
+            fetchLogs();
+        }
+
+        fetchLogs();
+        setInterval(fetchLogs, 10000);
+    </script>
+</body>
+</html>

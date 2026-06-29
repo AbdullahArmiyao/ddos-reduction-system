@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - NETWORK INTERFACES</title>
+    <link rel="stylesheet" href="/static/base.css">
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">S</div>
+            <div class="logo-text">SHIELD</div>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item"><a href="/"><span>■</span> Dashboard</a></li>
+            <li class="nav-item"><a href="/active-ips.html"><span>■</span> Active Flows</a></li>
+            <li class="nav-item active"><a href="/interfaces.html"><span>■</span> Interfaces</a></li>
+            <li class="nav-item"><a href="/firewall.html"><span>■</span> Firewall</a></li>
+            <li class="nav-item"><a href="/targets.html"><span>■</span> Targets</a></li>
+            <li class="nav-item"><a href="/logs.html"><span>■</span> Event Log</a></li>
+            <li class="nav-item"><a href="/ir.html"><span>■</span> Incident Response</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            GATEWAY CONSOLE v1.0.0
+        </div>
+    </div>
+
+    <div class="main-panel">
+        <div class="top-bar">
+            <div class="top-bar-title">
+                <h1>NIC_MATRIX // NET DEVICE INVENTORY</h1>
+            </div>
+        </div>
+
+        <div class="content-area">
+            <div class="hud-panel">
+                <div class="hud-panel-header">
+                    <div class="hud-panel-title">AVAILABLE NETWORK INTERFACES</div>
+                </div>
+                
+                <table>
+                    <thead>
+                        <tr>
+                            <th>INTERFACE NAME</th>
+                            <th>MAC ADDRESS</th>
+                            <th>IPv4 ADDRESS</th>
+                            <th>OPERATIONAL STATE</th>
+                            <th>PROMISCUOUS MODE</th>
+                            <th>GATEWAY STATUS</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ifaceTableBody">
+                        <tr>
+                            <td colspan="6" style="text-align: center; color: var(--text-dim);">QUERYING KERNEL SYSFS NETPATH...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <div class="hud-panel">
+                <div class="hud-panel-header">
+                    <div class="hud-panel-title">MONITORING ARCHITECTURE NOTE</div>
+                </div>
+                <div style="font-family: inherit; font-size: 0.8rem; line-height: 1.6; color: var(--text-dim);">
+                    The SHIELD Gateway operates in <span style="color: var(--accent-cyan);">Transparent Bridge/Tap Mode</span>.<br>
+                    Stage 1 sniffs raw frames using zero-copy <b>libpcap ring buffers</b> directly from active network device interfaces.<br>
+                    To change the primary interface under inspection, update the <code>--interface</code> argument inside <code>/etc/systemd/system/ddos-stage1.service</code> and restart the daemon.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchInterfaces() {
+            try {
+                const res = await fetch('/api/state');
+                if (res.status === 401) {
+                    window.location.href = '/static/login.html';
+                    return;
+                }
+                const data = await res.json();
+                
+                const tableBody = document.getElementById('ifaceTableBody');
+                const ifaces = data.interfaces || [];
+                const activeIface = data.active_interface || '';
+
+                if (ifaces.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--accent-alert);">ERROR: NO NETWORK INTERFACES FOUND.</td></tr>`;
+                    return;
+                }
+
+                let html = '';
+                ifaces.forEach(i => {
+                    const isActive = i.name === activeIface;
+                    const statusLabel = isActive 
+                        ? '<span class="badge badge-normal" style="border-color: var(--accent-cyan); color: var(--accent-cyan);">ACTIVE SNIFFER</span>' 
+                        : '<span class="badge badge-normal" style="border-color: var(--text-dim); color: var(--text-dim);">IDLE</span>';
+                    
+                    const stateLabel = i.up
+                        ? '<span style="color: #10b981; font-weight: bold;">UP</span>'
+                        : '<span style="color: var(--accent-alert);">DOWN</span>';
+
+                    html += `<tr>
+                        <td style="font-weight: bold; color: var(--text-bright);">${i.name}</td>
+                        <td>${i.mac || 'N/A'}</td>
+                        <td>${i.ip || 'UNASSIGNED'}</td>
+                        <td>${stateLabel}</td>
+                        <td>${i.promisc ? 'ENABLED' : 'DISABLED'}</td>
+                        <td>${statusLabel}</td>
+                    </tr>`;
+                });
+                
+                tableBody.innerHTML = html;
+            } catch (err) {
+                console.error("Failed to load interfaces:", err);
+            }
+        }
+
+        fetchInterfaces();
+        setInterval(fetchInterfaces, 10000);
+    </script>
+</body>
+</html>

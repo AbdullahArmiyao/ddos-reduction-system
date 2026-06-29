@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - MONITORING TARGETS</title>
+    <link rel="stylesheet" href="/static/base.css">
+    <style>
+        .target-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">S</div>
+            <div class="logo-text">SHIELD</div>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item"><a href="/"><span>■</span> Dashboard</a></li>
+            <li class="nav-item"><a href="/active-ips.html"><span>■</span> Active Flows</a></li>
+            <li class="nav-item"><a href="/interfaces.html"><span>■</span> Interfaces</a></li>
+            <li class="nav-item"><a href="/firewall.html"><span>■</span> Firewall</a></li>
+            <li class="nav-item active"><a href="/targets.html"><span>■</span> Targets</a></li>
+            <li class="nav-item"><a href="/logs.html"><span>■</span> Event Log</a></li>
+            <li class="nav-item"><a href="/ir.html"><span>■</span> Incident Response</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            GATEWAY CONSOLE v1.0.0
+        </div>
+    </div>
+
+    <div class="main-panel">
+        <div class="top-bar">
+            <div class="top-bar-title">
+                <h1>VICTIM_IP_CONFIG // PROTECTED ASSETS</h1>
+            </div>
+        </div>
+
+        <div class="content-area">
+            <div class="target-grid">
+                <!-- Add Target form -->
+                <div class="hud-panel">
+                    <div class="hud-panel-header">
+                        <div class="hud-panel-title">ADD MONITORING TARGET IP</div>
+                    </div>
+                    
+                    <form id="targetForm">
+                        <div style="margin-bottom: 16px;">
+                            <label style="display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase;">VICTIM IPv4 ADDRESS</label>
+                            <input type="text" id="targetIp" class="form-input" placeholder="ENTER IPv4 ADDRESS" pattern="^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$" required>
+                        </div>
+                        <div style="margin-bottom: 20px;">
+                            <label style="display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase;">ASSET NAME / DESCRIPTION</label>
+                            <input type="text" id="targetDesc" class="form-input" placeholder="e.g. PRIMARY WEBSERVER" required>
+                        </div>
+                        <button type="submit" class="btn" style="width: 100%;">DEPLOY TARGET</button>
+                    </form>
+                </div>
+
+                <!-- Protected Targets List -->
+                <div class="hud-panel">
+                    <div class="hud-panel-header">
+                        <div class="hud-panel-title">MONITORED VICTIM IP INVENTORY</div>
+                    </div>
+                    
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ASSET NAME</th>
+                                <th>IP ADDRESS</th>
+                                <th>STATUS</th>
+                                <th style="text-align: right;">ACTIONS</th>
+                            </tr>
+                        </thead>
+                        <tbody id="targetTableBody">
+                            <tr>
+                                <td colspan="4" style="text-align: center; color: var(--text-dim);">LOADING TARGETS...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchTargets() {
+            try {
+                const res = await fetch('/api/state');
+                if (res.status === 401) {
+                    window.location.href = '/static/login.html';
+                    return;
+                }
+                const data = await res.json();
+                
+                const tableBody = document.getElementById('targetTableBody');
+                const targets = data.victim_targets || []; // Should contain {ip, description, active}
+
+                if (targets.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--text-dim);">NO PROTECTED VICTIMS CONFIGURED.</td></tr>`;
+                    return;
+                }
+
+                let html = '';
+                targets.forEach(t => {
+                    const statusText = t.active 
+                        ? '<span style="color: var(--accent-cyan); font-weight: bold;">MONITORED</span>' 
+                        : '<span style="color: var(--text-dim);">STANDBY</span>';
+
+                    html += `<tr>
+                        <td style="font-weight: bold; color: var(--text-bright);">${t.description}</td>
+                        <td style="font-family: inherit;">${t.ip}</td>
+                        <td>${statusText}</td>
+                        <td style="text-align: right;">
+                            <button class="btn" style="padding: 2px 8px; font-size: 0.75rem; margin-right: 6px;" onclick="toggleTarget('${t.ip}')">TOGGLE</button>
+                            <button class="btn btn-danger" style="padding: 2px 8px; font-size: 0.75rem;" onclick="deleteTarget('${t.ip}')">PURGE</button>
+                        </td>
+                    </tr>`;
+                });
+                
+                tableBody.innerHTML = html;
+            } catch (err) {
+                console.error("Failed to load targets:", err);
+            }
+        }
+
+        document.getElementById('targetForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const ip = document.getElementById('targetIp').value;
+            const description = document.getElementById('targetDesc').value;
+            
+            const res = await fetch('/api/victim', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip, description })
+            });
+
+            if (res.ok) {
+                document.getElementById('targetIp').value = '';
+                document.getElementById('targetDesc').value = '';
+                fetchTargets();
+            } else {
+                const data = await res.json();
+                alert(data.detail || "Failed to add target.");
+            }
+        });
+
+        async function toggleTarget(ip) {
+            await fetch(`/api/victim/toggle?ip=${ip}`, { method: 'POST' });
+            fetchTargets();
+        }
+
+        async function deleteTarget(ip) {
+            if (confirm(`Purge monitoring configuration for ${ip}?`)) {
+                await fetch(`/api/victim?ip=${ip}`, { method: 'DELETE' });
+                fetchTargets();
+            }
+        }
+
+        fetchTargets();
+        setInterval(fetchTargets, 10000);
+    </script>
+</body>
+</html>

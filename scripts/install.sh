@@ -249,6 +249,10 @@ if [[ -d "$STAGE2_DIR" ]]; then
     info "Installing dependencies from requirements.txt..."
     "$STAGE2_DIR/venv/bin/pip" install --upgrade pip
     "$STAGE2_DIR/venv/bin/pip" install -r "$STAGE2_DIR/requirements.txt"
+    
+    info "Setting up administrative database and user..."
+    "$STAGE2_DIR/venv/bin/python" "$STAGE2_DIR/setup_admin.py"
+    
     success "Stage 2 Python environment setup complete."
 else
     warn "Stage 2 directory not found at $STAGE2_DIR. Skipping."
@@ -261,7 +265,7 @@ if $INSTALL_SERVICE && command -v systemctl &>/dev/null; then
     info "Installing systemd service units..."
 
     # Build the ExecStart command line.
-    EXEC_START="$INSTALL_DIR/$BINARY_NAME --interface $INTERFACE"
+    EXEC_START="\"$INSTALL_DIR/$BINARY_NAME\" --interface $INTERFACE"
     if [[ -n "$VICTIM_IP" ]]; then
         EXEC_START+=" --victim-ip $VICTIM_IP"
     else
@@ -312,8 +316,8 @@ After=network-online.target
 Type=simple
 User=root
 Group=root
-WorkingDirectory=$STAGE2_DIR
-ExecStart=$STAGE2_DIR/venv/bin/python stage2.py
+WorkingDirectory="$STAGE2_DIR"
+ExecStart="$STAGE2_DIR/venv/bin/python" stage2.py
 Restart=on-failure
 RestartSec=5s
 Environment="PYTHONUNBUFFERED=1"
@@ -343,11 +347,31 @@ fi
 # =============================================================================
 # Done
 # =============================================================================
-echo ""
-success "════════════════════════════════════════════"
-success " Stage 1 & 2 installation complete!         "
-success "════════════════════════════════════════════"
-echo ""
-info "Quick start:"
-info "  sudo $BINARY_NAME --interface $INTERFACE --victim-ip <YOUR_VICTIM_IP>"
+info "========================================================================"
+info "   CRITICAL ACTION REQUIRED: MACHINE LEARNING MODEL TRAINING"
+info "========================================================================"
+info "The Random Forest classifier must be trained on network traffic baselines"
+info "before starting the detection services."
+info ""
+info "Step 1: Generate Training Data (Capture on your gateway interface):"
+info ""
+info "  a) Capture NORMAL peacetime baseline traffic (Label 0) for ~2 minutes:"
+info "     sudo ddos_stage1 --interface $INTERFACE --victim-ip <VICTIM_IP> --train-csv stage1/training_data.csv --train-label 0"
+info ""
+info "  b) Capture FLASH CROWD (legitimate high-volume) traffic (Label 1) for ~2 minutes:"
+info "     sudo ddos_stage1 --interface $INTERFACE --victim-ip <VICTIM_IP> --train-csv stage1/training_data.csv --train-label 1"
+info ""
+info "  c) Capture DDoS attack traffic (Label 2) for ~2 minutes:"
+info "     sudo ddos_stage1 --interface $INTERFACE --victim-ip <VICTIM_IP> --train-csv stage1/training_data.csv --train-label 2"
+info ""
+info "Step 2: Train the Random Forest Classifier Model:"
+info "  Run the training script (this cleans transient rows, balances classes,"
+info "  and saves the model inside the stage2 directory):"
+info "     stage2/venv/bin/python stage2/train.py"
+info ""
+info "Step 3: Launch System Daemons:"
+info "  Once trained, start and enable the systemd services:"
+info "     sudo systemctl enable --now ddos-stage2"
+info "     sudo systemctl enable --now ddos-stage1"
+info "========================================================================"
 echo ""

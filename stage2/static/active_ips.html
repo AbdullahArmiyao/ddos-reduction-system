@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - ACTIVE FLOWS</title>
+    <link rel="stylesheet" href="/static/base.css">
+    <style>
+        .flow-table td {
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .action-cell {
+            text-align: right;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">S</div>
+            <div class="logo-text">SHIELD</div>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item"><a href="/"><span>■</span> Dashboard</a></li>
+            <li class="nav-item active"><a href="/active-ips.html"><span>■</span> Active Flows</a></li>
+            <li class="nav-item"><a href="/interfaces.html"><span>■</span> Interfaces</a></li>
+            <li class="nav-item"><a href="/firewall.html"><span>■</span> Firewall</a></li>
+            <li class="nav-item"><a href="/targets.html"><span>■</span> Targets</a></li>
+            <li class="nav-item"><a href="/logs.html"><span>■</span> Event Log</a></li>
+            <li class="nav-item"><a href="/ir.html"><span>■</span> Incident Response</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            GATEWAY CONSOLE v1.0.0
+        </div>
+    </div>
+
+    <div class="main-panel">
+        <div class="top-bar">
+            <div class="top-bar-title">
+                <h1>FLOW_DB // LAYER 4 CONCURRENT PEERS</h1>
+            </div>
+            <div class="system-status">
+                <div class="status-pill">
+                    <span id="flowCountPill" class="badge badge-normal">0 ACTIVE CONNECTIONS</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="content-area">
+            <div class="hud-panel">
+                <div class="hud-panel-header">
+                    <div class="hud-panel-title">LIVE CONNECTION SPECTRUM (TOP 20 FLOWS)</div>
+                </div>
+                
+                <table class="flow-table">
+                    <thead>
+                        <tr>
+                            <th>SOURCE ADDRESS</th>
+                            <th>DESTINATION PORT</th>
+                            <th>PROTOCOL</th>
+                            <th>FLOW RATE (PPS)</th>
+                            <th>MITIGATION STATUS</th>
+                            <th class="action-cell">ADMINISTRATIVE ACTIONS</th>
+                        </tr>
+                    </thead>
+                    <tbody id="flowTableBody">
+                        <tr>
+                            <td colspan="6" style="text-align: center; color: var(--text-dim);">AWAITING TELEMETRY STACK SYNC...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchFlows() {
+            try {
+                const res = await fetch('/api/state');
+                if (res.status === 401) {
+                    window.location.href = '/static/login.html';
+                    return;
+                }
+                const data = await res.json();
+                
+                // Get whitelist and blocked lists
+                const whitelisted = data.whitelisted_ips || [];
+                const blocked = data.blocked_ips || [];
+                
+                const tableBody = document.getElementById('flowTableBody');
+                const flows = data.active_flows || [];
+                
+                document.getElementById('flowCountPill').innerText = `${flows.length} ACTIVE FLOWS`;
+
+                if (flows.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-dim);">PEACETIME: NO ACTIVE IP FLOWS DETECTED ON INTERFACE.</td></tr>`;
+                    return;
+                }
+
+                let html = '';
+                flows.forEach(f => {
+                    let statusLabel = '<span class="badge badge-normal">MONITORED</span>';
+                    let actionBtn = '';
+                    
+                    if (whitelisted.includes(f.ip)) {
+                        statusLabel = '<span class="badge badge-normal" style="border-color:#10b981; color:#10b981;">WHITELISTED</span>';
+                        actionBtn = `<button class="btn btn-danger" onclick="blockIp('${f.ip}')" disabled style="opacity: 0.5;">BLOCK</button>`;
+                    } else if (blocked.includes(f.ip)) {
+                        statusLabel = '<span class="badge badge-ddos">BLOCKED</span>';
+                        actionBtn = `<button class="btn" onclick="unblockIp('${f.ip}')">RELEASE</button>`;
+                    } else {
+                        actionBtn = `
+                            <button class="btn btn-danger" style="margin-right: 6px;" onclick="blockIp('${f.ip}')">BLOCK</button>
+                            <button class="btn" onclick="whitelistIp('${f.ip}')">WHITELIST</button>
+                        `;
+                    }
+
+                    html += `<tr>
+                        <td>${f.ip}</td>
+                        <td>${f.port}</td>
+                        <td>${f.proto}</td>
+                        <td style="color: var(--accent-cyan); font-weight: bold;">${f.rate.toFixed(1)}</td>
+                        <td>${statusLabel}</td>
+                        <td class="action-cell">${actionBtn}</td>
+                    </tr>`;
+                });
+                
+                tableBody.innerHTML = html;
+            } catch (err) {
+                console.error("Failed to load active flows:", err);
+            }
+        }
+
+        async function blockIp(ip) {
+            if (confirm(`Block ${ip} immediately?`)) {
+                await fetch('/api/firewall/block', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip, duration: 600 }) // Default 10 min block
+                });
+                fetchFlows();
+            }
+        }
+
+        async function unblockIp(ip) {
+            if (confirm(`Unblock ${ip}?`)) {
+                await fetch('/api/firewall/unblock', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                fetchFlows();
+            }
+        }
+
+        async function whitelistIp(ip) {
+            if (confirm(`Add ${ip} to Whitelist?`)) {
+                await fetch('/api/whitelist', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                fetchFlows();
+            }
+        }
+
+        fetchFlows();
+        setInterval(fetchFlows, 10000);
+    </script>
+</body>
+</html>

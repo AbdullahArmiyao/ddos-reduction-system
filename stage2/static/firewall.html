@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHIELD GATEWAY - FIREWALL STATS</title>
+    <link rel="stylesheet" href="/static/base.css">
+    <style>
+        .firewall-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo-area">
+            <div class="logo-icon">S</div>
+            <div class="logo-text">SHIELD</div>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item"><a href="/"><span>■</span> Dashboard</a></li>
+            <li class="nav-item"><a href="/active-ips.html"><span>■</span> Active Flows</a></li>
+            <li class="nav-item"><a href="/interfaces.html"><span>■</span> Interfaces</a></li>
+            <li class="nav-item active"><a href="/firewall.html"><span>■</span> Firewall</a></li>
+            <li class="nav-item"><a href="/targets.html"><span>■</span> Targets</a></li>
+            <li class="nav-item"><a href="/logs.html"><span>■</span> Event Log</a></li>
+            <li class="nav-item"><a href="/ir.html"><span>■</span> Incident Response</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            GATEWAY CONSOLE v1.0.0
+        </div>
+    </div>
+
+    <div class="main-panel">
+        <div class="top-bar">
+            <div class="top-bar-title">
+                <h1>NETFILTER_IPS // SECURITY POLICY MANAGER</h1>
+            </div>
+        </div>
+
+        <div class="content-area">
+            <div class="firewall-grid">
+                <!-- Whitelisted IPs -->
+                <div class="hud-panel">
+                    <div class="hud-panel-header">
+                        <div class="hud-panel-title">ADMINISTRATIVE IP WHITELIST</div>
+                    </div>
+                    
+                    <form id="whitelistForm" class="form-group">
+                        <input type="text" id="whitelistIp" class="form-input" placeholder="ENTER IPv4 ADDRESS" pattern="^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$" required>
+                        <button type="submit" class="btn">WHITELIST</button>
+                    </form>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>WHITELISTED ADDRESS</th>
+                                <th style="text-align: right;">ACTION</th>
+                            </tr>
+                        </thead>
+                        <tbody id="whitelistTableBody">
+                            <tr>
+                                <td colspan="2" style="text-align: center; color: var(--text-dim);">LOADING WHITELIST ENTRIES...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Blocked IPs -->
+                <div class="hud-panel">
+                    <div class="hud-panel-header">
+                        <div class="hud-panel-title">ACTIVE KERNEL BLOCKS (IPSET: ddos_blocklist)</div>
+                    </div>
+                    
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>BLOCKED ADDRESS</th>
+                                <th>DECAY TIMEOUT</th>
+                                <th style="text-align: right;">ACTION</th>
+                            </tr>
+                        </thead>
+                        <tbody id="blockedTableBody">
+                            <tr>
+                                <td colspan="3" style="text-align: center; color: var(--text-dim);">LOADING ACTIVE BLOCKS...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchFirewall() {
+            try {
+                const res = await fetch('/api/state');
+                if (res.status === 401) {
+                    window.location.href = '/static/login.html';
+                    return;
+                }
+                const data = await res.json();
+                
+                // Render whitelist
+                const wlBody = document.getElementById('whitelistTableBody');
+                const whitelisted = data.whitelisted_ips || [];
+                if (whitelisted.length === 0) {
+                    wlBody.innerHTML = `<tr><td colspan="2" style="text-align: center; color: var(--text-dim);">NO IP ADDRESSES WHITELISTED.</td></tr>`;
+                } else {
+                    let wlHtml = '';
+                    whitelisted.forEach(ip => {
+                        wlHtml += `<tr>
+                            <td style="font-weight: bold; color: var(--text-bright);">${ip}</td>
+                            <td style="text-align: right;"><button class="btn btn-danger" style="padding: 2px 8px; font-size: 0.75rem;" onclick="removeWhitelist('${ip}')">REMOVE</button></td>
+                        </tr>`;
+                    });
+                    wlBody.innerHTML = wlHtml;
+                }
+
+                // Render blocks
+                const blBody = document.getElementById('blockedTableBody');
+                const blocked = data.blocked_ips_detail || []; // Should contain {ip, remaining_seconds}
+                if (blocked.length === 0) {
+                    blBody.innerHTML = `<tr><td colspan="3" style="text-align: center; color: var(--text-dim);">PEACETIME: NO ACTIVE IPSET BLOCK RULES.</td></tr>`;
+                } else {
+                    let blHtml = '';
+                    blocked.forEach(b => {
+                        blHtml += `<tr>
+                            <td style="font-weight: bold; color: var(--accent-alert);">${b.ip}</td>
+                            <td style="color: #ff9f0a; font-weight: bold;">${b.remaining_seconds}s REMAINING</td>
+                            <td style="text-align: right;"><button class="btn" style="padding: 2px 8px; font-size: 0.75rem;" onclick="releaseBlock('${b.ip}')">RELEASE</button></td>
+                        </tr>`;
+                    });
+                    blBody.innerHTML = blHtml;
+                }
+            } catch (err) {
+                console.error("Failed to fetch firewall status:", err);
+            }
+        }
+
+        document.getElementById('whitelistForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const ip = document.getElementById('whitelistIp').value;
+            const res = await fetch('/api/whitelist', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip })
+            });
+            if (res.ok) {
+                document.getElementById('whitelistIp').value = '';
+                fetchFirewall();
+            } else {
+                const data = await res.json();
+                alert(data.detail || "Failed to whitelist IP.");
+            }
+        });
+
+        async function removeWhitelist(ip) {
+            if (confirm(`Remove ${ip} from whitelist?`)) {
+                await fetch(`/api/whitelist?ip=${ip}`, { method: 'DELETE' });
+                fetchFirewall();
+            }
+        }
+
+        async function releaseBlock(ip) {
+            if (confirm(`Manually release firewall block for ${ip}?`)) {
+                await fetch('/api/firewall/unblock', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                fetchFirewall();
+            }
+        }
+
+        fetchFirewall();
+        setInterval(fetchFirewall, 10000);
+    </script>
+</body>
+</html>
