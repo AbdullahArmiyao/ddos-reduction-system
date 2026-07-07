@@ -187,7 +187,7 @@ After Welford processes enough windows to establish a baseline, Layer 3 compares
 
 **The anomaly flags bitmask:**
 - `0x01` — rate only tripped (volumetric, diverse sources → possible flash crowd)
-- `0x02` — entropy only tripped (concentrated source, lower volume → low-and-slow)
+- `0x02` — entropy only tripped (concentrated source, lower volume)
 - `0x03` — **both tripped** (high volume + concentrated source → highest-confidence DDoS)
 
 Stage 2 uses this flag plus four additional features in the Random Forest to make the final call.
@@ -381,7 +381,7 @@ RUST_LOG=warn   # anomalies and errors only
 | Flag | Meaning | Likely Cause |
 |---|---|---|
 | `0x01` | Rate only | Volumetric flood, diverse sources — possible flash crowd |
-| `0x02` | Entropy only | Concentrated source, low volume — low-and-slow attack |
+| `0x02` | Entropy only | Concentrated source, low volume |
 | `0x03` | Both | High volume + single dominant source — highest confidence DDoS |
 
 ---
