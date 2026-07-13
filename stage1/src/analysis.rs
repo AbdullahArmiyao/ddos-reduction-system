@@ -163,6 +163,10 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     let mut welford_rate    = WelfordAccumulator::default(); // tracks r (pps)
     let mut welford_entropy = WelfordAccumulator::default(); // tracks h (bits)
 
+    // Long-term peacetime references (ultra-slow EWMA references)
+    let mut peacetime_rate_ref: Option<f64> = None;
+    let mut peacetime_entropy_ref: Option<f64> = None;
+
     // IPC socket to Stage 2 (Python). Connected lazily on first anomaly.
     let mut ipc = IpcSocket::with_path(&cfg.socket_path);
 
@@ -237,10 +241,16 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             0.0
         };
         
-        // Asymmetric decay: Use an aggressive alpha (e.g. 0.5) when the window rate is decreasing
-        // compared to the current EWMA value, or when we are in a cooldown recovery window.
-        // Otherwise, use the standard configured alpha (e.g. 0.125) to avoid reacting to single transient spikes.
-        let active_alpha = if window_rate < ewma.snapshot() || cooldown_counter > 0 {
+        // Asymmetric decay: 
+        // 1. Cliff-drop decay: If we detect a precipitous drop in raw rate (<10% of EWMA)
+        //    AND we are not in active cooldown (cooldown_counter == 0), use alpha = 0.8
+        //    to instantly flush the rate history (e.g. after a firewall block).
+        // 2. Otherwise, if the raw rate is decreasing or we are in a cooldown recovery window,
+        //    use a moderately fast alpha (0.5).
+        // 3. Otherwise, use the standard configured alpha to avoid reacting to single transient spikes.
+        let active_alpha = if window_rate < 0.1 * ewma.snapshot() && cooldown_counter == 0 {
+            0.8f64.max(cfg.ewma_alpha)
+        } else if window_rate < ewma.snapshot() || cooldown_counter > 0 {
             0.5f64.max(cfg.ewma_alpha)
         } else {
             cfg.ewma_alpha
@@ -341,17 +351,32 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         // Cap entropy standard deviation at 0.5 bits, floor at 0.05 bits.
         let sigma_h = raw_sigma_h.max(0.05).min(0.5);
 
-        // 2. High-Sensitivity Cooldown Mode: If we are within the cooldown recovery window,
-        // reduce the anomaly threshold multiplier k to increase sensitivity to subsequent attack pulses.
-        let active_k = if cooldown_counter > 0 {
+        // 2. High-Sensitivity Cooldown Mode & Entropy-Guided Scaling:
+        // - If we are within the cooldown recovery window, reduce the baseline multiplier to increase sensitivity.
+        // - Scale the rate multiplier up if the entropy is high (indicating high diversity/flash crowd)
+        //   to avoid false rate alarms.
+        let base_k = if cooldown_counter > 0 {
             (cfg.k * 0.5).max(1.0)
         } else {
             cfg.k
         };
 
+        // Dynamic k-Scaling: Scale k relative to the running mean of entropy (mean_h)
+        // instead of a hardcoded 4.0 divisor. Use 4.0 as a fallback if mean_h is 0.0 (warmup).
+        // Also enforce an Emergency Volume Cap: if raw rate exceeds 10 standard deviations above the mean,
+        // override entropy scaling to prevent high-entropy botnet floods from evading detection.
+        let mean_h = welford_entropy.mean;
+        let rate_k = if r > (welford_rate.mean + 10.0 * sigma_r) {
+            base_k
+        } else {
+            let divisor = if mean_h > 0.0 { mean_h } else { 4.0 };
+            base_k * (h / divisor).max(1.0)
+        };
+        let entropy_k = base_k;
+
         // Evaluate the two anomaly thresholds.
-        let rate_boundary    = welford_rate.mean + active_k * sigma_r;
-        let entropy_boundary = welford_entropy.mean - active_k * sigma_h;
+        let rate_boundary    = welford_rate.mean + rate_k * sigma_r;
+        let entropy_boundary = welford_entropy.mean - entropy_k * sigma_h;
 
         // Build anomaly flags bitmask.
         let mut anomaly_flags: u8 = 0;
@@ -365,15 +390,48 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         // Determine if this window breached the original configuration-level threshold (real anomaly).
         // This prevents the system from getting trapped in an infinite cooldown loop due to minor
         // normal fluctuations breaching the tighter active_k.
-        let real_rate_boundary = welford_rate.mean + cfg.k * sigma_r;
+        let real_rate_k = if r > (welford_rate.mean + 10.0 * sigma_r) {
+            cfg.k
+        } else {
+            let divisor = if mean_h > 0.0 { mean_h } else { 4.0 };
+            cfg.k * (h / divisor).max(1.0)
+        };
+        let real_rate_boundary = welford_rate.mean + real_rate_k * sigma_r;
         let real_entropy_boundary = welford_entropy.mean - cfg.k * sigma_h;
         let is_real_anomaly = r > real_rate_boundary || h < real_entropy_boundary;
 
         // 3. Conditional Updates: Feed scalars into Welford accumulators ONLY if the window is clean
         // and we are not in cooldown. This keeps the baseline stable and prevents statistical explosion.
         if anomaly_flags == 0 && cooldown_counter == 0 {
-            welford_rate.update(r);
-            welford_entropy.update(h);
+            // Outlier Rejection: Reject updates if the sample is > 5 standard deviations away.
+            // Baseline Capping: Impose a hard ceiling of 10000.0 pps on the Welford mean rate.
+            let is_rate_outlier = sigma_r > 0.0 && (r - welford_rate.mean).abs() > 5.0 * sigma_r;
+            if !is_rate_outlier && welford_rate.mean < 10000.0 {
+                welford_rate.update(r);
+            }
+
+            let is_entropy_outlier = sigma_h > 0.0 && (h - welford_entropy.mean).abs() > 5.0 * sigma_h;
+            if !is_entropy_outlier {
+                welford_entropy.update(h);
+            }
+
+            // Peacetime Reference (Long-Term Drift Detection):
+            // Update peacetime references with alpha = 0.001
+            let rate_ref = peacetime_rate_ref.get_or_insert(r);
+            *rate_ref = 0.001 * r + 0.999 * (*rate_ref);
+
+            let entropy_ref = peacetime_entropy_ref.get_or_insert(h);
+            *entropy_ref = 0.001 * h + 0.999 * (*entropy_ref);
+            
+            // Baseline Poisoning Check:
+            // Revert running mean if it drifts > 50% from peacetime reference.
+            if (*rate_ref) > 0.0 && (welford_rate.mean - *rate_ref).abs() / (*rate_ref) > 0.50 {
+                warn!(
+                    "[!!!] Baseline Poisoning Detected! Welford mean rate ({:.2}) deviated >50% from peacetime reference ({:.2}). Reverting mean.",
+                    welford_rate.mean, *rate_ref
+                );
+                welford_rate.mean = *rate_ref;
+            }
         }
 
         // Manage cooldown counter: if a real anomaly is detected, set to 10. Otherwise decrement.

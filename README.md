@@ -14,7 +14,7 @@ This project solves that by building a gateway that **learns what your normal tr
 The system is split into two stages:
 
 - **Stage 1 (Rust):** Sits inline on the network bridge, watches every packet, runs lightweight statistics, and raises an anomaly flag when something looks wrong.
-- **Stage 2 (Python, not yet built):** Wakes up only when Stage 1 flags something, runs a Random Forest classifier to confirm whether it's a real attack or a flash crowd, then issues kernel-level blocks via `ipset`.
+- **Stage 2 (Python):** Wakes up only when Stage 1 flags something (or on a periodic heartbeat), runs a Random Forest classifier to confirm whether it's a real attack or a flash crowd, and issues kernel-level drop rules (`ddos_blocklist` ipset) or rate limits (`ddos_ratelimit` ipset using iptables hashlimit) in real time. It also hosts a persistent FastAPI-based dashboard.
 
 
 ## Network Topology and Virtualization Gotchas
@@ -420,28 +420,8 @@ sudo bash scripts/uninstall.sh --remove-build --remove-rust
 
 ## Stage 2 Integration (Python)
 
-Stage 2 listens on `/tmp/ddos_stage1.sock`, unpacks incoming 88-byte `FeatureVector` structs, and classifies traffic in real-time.
+Stage 2 listens on the Unix domain socket `/tmp/ddos_stage1.sock`, unpacks the incoming 88-byte `FeatureVector` structs, and classifies traffic in real-time. It operates as a FastAPI application with a persistent SQLite storage layer and a dynamic Chart.js dashboard.
 
-```python
-import socket, struct
-
-# Python-side wire format (matches Rust exactly)
-FORMAT = '<9d16s'   # little-endian: 9 x f64 + 16-byte IP address = 88 bytes
-FIELDS = (
-    'entropy', 'ewma_rate', 'mean_h', 'mean_r', 'sigma_h', 'sigma_r',
-    'proto_ratio', 'dominant_ip_ratio', 'timestamp', 'dominant_ip'
-)
-
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-    srv.bind('/tmp/ddos_stage1.sock')
-    srv.listen(1)
-    conn, _ = srv.accept()
-    data = conn.recv(88)
-    values = struct.unpack(FORMAT, data)
-    fv = dict(zip(FIELDS[:-1], values[:-1]))
-    # dominant_ip is values[-1] (16 bytes)
-    # → pass features to RandomForestClassifier, then block dominant_ip using ipset
-```
 
 The eight features fed to the Random Forest classifier:
 1. Source IP Entropy (`entropy`)
@@ -452,6 +432,26 @@ The eight features fed to the Random Forest classifier:
 6. Packet Rate Standard Deviation (`sigma_r`)
 7. Protocol Ratio (`proto_ratio`)
 8. Dominant Source IP Ratio (`dominant_ip_ratio`)
+
+### Core Safeguards and Adaptive Baselines
+
+To ensure high-performance, robust, and poison-resistant mitigation, Stage 2 integrates the following mechanisms:
+
+1. **Adaptive Safety Overrides:**
+   - Overrides ML predictions using dynamic statistical boundaries to ensure protection under extreme volumetric spikes:
+     - Volumetric Suspect: `ewma_rate > mean_r + 2.0 * sigma_r`
+     - Volumetric Extreme Flood: `ewma_rate > mean_r + 10.0 * sigma_r` (always flags Class 2)
+     - Concentrated Source/Entropy Drop: `entropy < mean_h - 2.0 * sigma_h` (always flags Class 2)
+
+2. **Tiered Mitigation Strategy:**
+   - **Full Block (`ddos_blocklist`):** Drops all packets from the IP. Triggered only for high-confidence single-source floods (where `dominant_ip_ratio >= 0.40` and `dominant_rate >= mean_r + 2.0 * sigma_r`).
+   - **Interactive Rate-Limiting (`ddos_ratelimit`):** Restricts the IP to a maximum of 50 pps using `iptables` and `hashlimit`. This is applied to distributed flows (Cluster Block fallback mode) and elevated dominant IPs during legitimate flash crowds, avoiding disruption of benign users.
+
+3. **Welford Baseline Poisoning Protection:**
+   - Sits on Stage 1 to guard the parameters updated by Stage 2. Enforces baseline capping (maximum 10,000 pps mean rate), outlier rejection ($> 5\sigma$ deviations are ignored), and peacetime reference reversion if the Welford mean drifts by more than 50% from an ultra-slow EWMA peacetime baseline ($\alpha = 0.001$).
+
+4. **Kernel Resource Capacity Monitor:**
+   - A background thread polls the blocklist every 30 seconds and logs a critical warning if the kernel `ipset` table exceeds 80% capacity.
 
 ---
 

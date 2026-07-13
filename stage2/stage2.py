@@ -112,9 +112,9 @@ active_sessions = {}  # session_token -> last_active_timestamp
 # -----------------------------------------------------------------------------
 
 def setup_ipset():
-    """Ensure the target ipset list exists and is linked to iptables rules."""
+    """Ensure the target ipset lists exist and are linked to iptables rules."""
     try:
-        # Create hash:ip set if it doesn't exist
+        # 1. Create ddos_blocklist set (outright drop)
         subprocess.run(
             ["ipset", "create", "ddos_blocklist", "hash:ip", "timeout", "3600"],
             stdout=subprocess.DEVNULL,
@@ -122,7 +122,7 @@ def setup_ipset():
         )
         logging.info("[+] Kernel ipset 'ddos_blocklist' verified/created.")
 
-        # Link ipset to iptables INPUT chain if not already present
+        # Link ddos_blocklist to INPUT chain if not present
         check_input = subprocess.run(
             ["iptables", "-C", "INPUT", "-m", "set", "--match-set", "ddos_blocklist", "src", "-j", "DROP"],
             stdout=subprocess.DEVNULL,
@@ -136,7 +136,7 @@ def setup_ipset():
             )
             logging.info("[+] Linked 'ddos_blocklist' to iptables INPUT chain.")
             
-        # Link ipset to iptables FORWARD chain if not already present
+        # Link ddos_blocklist to FORWARD chain if not present
         check_forward = subprocess.run(
             ["iptables", "-C", "FORWARD", "-m", "set", "--match-set", "ddos_blocklist", "src", "-j", "DROP"],
             stdout=subprocess.DEVNULL,
@@ -149,6 +149,42 @@ def setup_ipset():
                 stderr=subprocess.DEVNULL
             )
             logging.info("[+] Linked 'ddos_blocklist' to iptables FORWARD chain.")
+
+        # 2. Create ddos_ratelimit set (rate-limits traffic to 50 pps per IP)
+        subprocess.run(
+            ["ipset", "create", "ddos_ratelimit", "hash:ip", "timeout", "3600"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        logging.info("[+] Kernel ipset 'ddos_ratelimit' verified/created.")
+
+        # Link ddos_ratelimit to INPUT chain if not present
+        check_rl_input = subprocess.run(
+            ["iptables", "-C", "INPUT", "-m", "set", "--match-set", "ddos_ratelimit", "src", "-m", "hashlimit", "--hashlimit-above", "50/sec", "--hashlimit-burst", "20", "--hashlimit-name", "ddoslimit", "--hashlimit-mode", "srcip", "-j", "DROP"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if check_rl_input.returncode != 0:
+            subprocess.run(
+                ["iptables", "-I", "INPUT", "-m", "set", "--match-set", "ddos_ratelimit", "src", "-m", "hashlimit", "--hashlimit-above", "50/sec", "--hashlimit-burst", "20", "--hashlimit-name", "ddoslimit", "--hashlimit-mode", "srcip", "-j", "DROP"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            logging.info("[+] Linked 'ddos_ratelimit' with 50pps hashlimit to iptables INPUT chain.")
+
+        # Link ddos_ratelimit to FORWARD chain if not present
+        check_rl_forward = subprocess.run(
+            ["iptables", "-C", "FORWARD", "-m", "set", "--match-set", "ddos_ratelimit", "src", "-m", "hashlimit", "--hashlimit-above", "50/sec", "--hashlimit-burst", "20", "--hashlimit-name", "ddoslimit", "--hashlimit-mode", "srcip", "-j", "DROP"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if check_rl_forward.returncode != 0:
+            subprocess.run(
+                ["iptables", "-I", "FORWARD", "-m", "set", "--match-set", "ddos_ratelimit", "src", "-m", "hashlimit", "--hashlimit-above", "50/sec", "--hashlimit-burst", "20", "--hashlimit-name", "ddoslimit", "--hashlimit-mode", "srcip", "-j", "DROP"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            logging.info("[+] Linked 'ddos_ratelimit' with 50pps hashlimit to iptables FORWARD chain.")
 
     except Exception as e:
         logging.warning(f"[-] Could not setup/verify ipset or iptables: {e}")
@@ -178,7 +214,7 @@ def block_ip(ip, duration=3600):
         if res.returncode == 0:
             logging.warning(f"[!!!] MITIGATION TRIGGERED: Blocked offending IP {ip} (duration: {duration}s)")
             # Log to SQLite
-            log_incident(now, ip, "DDoS")
+            log_incident(now, ip, "Blocked")
         else:
             logging.error(f"[-] Failed to block IP {ip}: {res.stderr.strip()}")
     except Exception as e:
@@ -186,23 +222,110 @@ def block_ip(ip, duration=3600):
     finally:
         recently_blocked[ip] = now
 
-def unblock_ip(ip):
-    """Remove IP from ddos_blocklist."""
+def ratelimit_ip(ip, duration=3600):
+    """Add offending IP to ddos_ratelimit set (enforces 50pps cap)."""
+    global recently_blocked
+    now = time.time()
+    
+    if ip in recently_blocked and now - recently_blocked[ip] < 10.0:
+        return
+        
     try:
+        # Check whitelist bypass
+        whitelist = load_json_file(WHITELIST_PATH, [])
+        if ip in whitelist:
+            logging.info(f"[Whitelist Bypass] Skipping rate-limit for whitelisted administrative IP: {ip}")
+            return
+
         res = subprocess.run(
-            ["ipset", "del", "ddos_blocklist", ip],
+            ["ipset", "add", "ddos_ratelimit", ip, "timeout", str(duration), "-exist"],
             capture_output=True,
             text=True
         )
         if res.returncode == 0:
-            logging.info(f"[+] Released firewall block for IP {ip}")
+            logging.warning(f"[!!!] MITIGATION TRIGGERED: Rate-limited offending IP {ip} (duration: {duration}s, 50pps cap)")
+            # Log to SQLite
+            log_incident(now, ip, "Rate Limited")
+        else:
+            logging.error(f"[-] Failed to rate-limit IP {ip}: {res.stderr.strip()}")
+    except Exception as e:
+        logging.error(f"[-] Error calling ipset: {e}")
+    finally:
+        recently_blocked[ip] = now
+
+def unblock_ip(ip):
+    """Remove IP from both ddos_blocklist and ddos_ratelimit."""
+    try:
+        res1 = subprocess.run(
+            ["ipset", "del", "ddos_blocklist", ip],
+            capture_output=True,
+            text=True
+        )
+        res2 = subprocess.run(
+            ["ipset", "del", "ddos_ratelimit", ip],
+            capture_output=True,
+            text=True
+        )
+        if res1.returncode == 0 or res2.returncode == 0:
+            logging.info(f"[+] Released firewall block/rate-limit for IP {ip}")
             return True
         else:
-            logging.error(f"[-] Failed to release IP {ip}: {res.stderr.strip()}")
+            logging.error(f"[-] Failed to release IP {ip}: {res1.stderr.strip()} / {res2.stderr.strip()}")
             return False
     except Exception as e:
         logging.error(f"[-] Error calling ipset: {e}")
         return False
+
+
+def check_ipset_capacity():
+    """Check ipset entries count vs maxelem and log alert if > 80% capacity."""
+    try:
+        res = subprocess.run(
+            ["ipset", "list", "ddos_blocklist"],
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0:
+            lines = res.stdout.splitlines()
+            maxelem = 65536
+            entries = 0
+            for line in lines:
+                if "maxelem" in line:
+                    parts = line.split()
+                    try:
+                        # Find maxelem token
+                        for idx, p in enumerate(parts):
+                            if p == "maxelem":
+                                maxelem = int(parts[idx + 1])
+                                break
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("Number of entries:"):
+                    try:
+                        entries = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+            
+            if maxelem > 0:
+                usage = entries / maxelem
+                if usage > 0.80:
+                    logging.critical(
+                        f"[!!!] IPSET CAPACITY ALERT: ddos_blocklist is at {usage:.1%} capacity "
+                        f"({entries}/{maxelem} entries). New attackers may fail to block."
+                    )
+                else:
+                    logging.info(f"[+] ipset capacity status: {entries}/{maxelem} entries ({usage:.1%})")
+        else:
+            logging.error(f"[-] Failed to query ipset list: {res.stderr.strip()}")
+    except Exception as e:
+        logging.error(f"[-] Error checking ipset capacity: {e}")
+
+def run_ipset_monitor():
+    """Background thread to monitor ipset capacity status every 30 seconds."""
+    logging.info("[+] Starting ipset capacity monitor thread...")
+    while True:
+        check_ipset_capacity()
+        time.sleep(30)
 
 def get_blocked_ips():
     """Extract blocked IPs and remaining timeouts directly from kernel."""
@@ -359,11 +482,18 @@ def run_ipc_receiver():
                     ])
                     pred_class = int(clf.predict(features_df)[0])
 
-                # Safety overrides
-                if pred_class in (0, 1) and ewma_rate > 2000.0:
-                    if ewma_rate > 10000.0:
+                # Adaptive Safety overrides
+                # 1. Rate anomaly trigger: mean_r + 2.0 * sigma_r
+                rate_anomaly_boundary = mean_r + 2.0 * sigma_r
+                # 2. Extreme rate trigger: mean_r + 10.0 * sigma_r
+                extreme_rate_boundary = mean_r + 10.0 * sigma_r
+                # 3. Entropy anomaly trigger: mean_h - 2.0 * sigma_h
+                entropy_anomaly_boundary = mean_h - 2.0 * sigma_h
+
+                if pred_class in (0, 1) and ewma_rate > rate_anomaly_boundary:
+                    if ewma_rate > extreme_rate_boundary:
                         pred_class = 2
-                    elif entropy < 3.5 or dominant_ip_ratio > 0.75:
+                    elif entropy < entropy_anomaly_boundary or dominant_ip_ratio > 0.75:
                         pred_class = 2
                     else:
                         pred_class = 1
@@ -390,13 +520,56 @@ def run_ipc_receiver():
                 # Save history
                 log_metrics_history(timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, 2.0)
 
-                # Trigger block
+                # Trigger block / rate-limit
                 if pred_class == 2:
                     if ip_str not in ("Unknown", "0.0.0.0", "::"):
-                        block_ip(ip_str)
+                        # Guard: Only block the dominant IP if:
+                        # 1. It represents a significant portion of the traffic (ratio >= 40%).
+                        # 2. Its individual packet rate exceeds the dynamic malicious threshold (mean_r + 2.0 * sigma_r).
+                        # This prevents collateral damage on legitimate flash crowd users and post-mitigation decay tails.
+                        dominant_rate = ewma_rate * dominant_ip_ratio
+                        dominant_rate_threshold = mean_r + 2.0 * sigma_r
+                        if dominant_ip_ratio >= 0.40 and dominant_rate >= dominant_rate_threshold:
+                            block_ip(ip_str)
+                        else:
+                            # Cluster Block Mode: Pivot to mitigation of distributed attackers (botnets)
+                            # Parse active flows and rate-limit any flow that exceeds mean_r + sigma_r
+                            logging.warning(
+                                f"[!] DDoS detected but dominant IP {ip_str} bypassed single-source guard "
+                                f"(ratio={dominant_ip_ratio:.2%}, est_rate={dominant_rate:.2f} pps). "
+                                f"Pivoting to Cluster Block mode for distributed mitigation..."
+                            )
+                            cluster_blocked_any = False
+                            if os.path.exists(FLOWS_PATH):
+                                try:
+                                    with open(FLOWS_PATH, "r") as f:
+                                        data = json.load(f)
+                                        # Adaptive individual flow threshold: mean_r + sigma_r (min 50.0 pps floor)
+                                        flow_threshold = max(50.0, mean_r + sigma_r)
+                                        for flow in data.get("active_ips", []):
+                                            f_ip = flow.get("ip")
+                                            f_rate = flow.get("rate", 0.0)
+                                            # If an individual flow in the cluster is sending >= flow_threshold, rate-limit it
+                                            if f_ip not in ("Unknown", "0.0.0.0", "::") and f_rate >= flow_threshold:
+                                                logging.warning(f"[Cluster Block] Rate-limiting high-rate distributed flow: {f_ip} ({f_rate:.2f} pps, threshold: {flow_threshold:.2f} pps)")
+                                                ratelimit_ip(f_ip)
+                                                cluster_blocked_any = True
+                                except Exception as ce:
+                                    logging.error(f"[-] Cluster Block failed to parse flows: {ce}")
+                            if not cluster_blocked_any:
+                                logging.warning("[!] Cluster Block completed: No individual botnet flow exceeded adaptive threshold.")
                 elif pred_class == 1:
                     # Log flash crowd incident
                     log_incident(timestamp, ip_str, "Flash Crowd")
+                    # If the dominant IP rate is highly elevated during a flash crowd, apply rate-limit (not block)
+                    dominant_rate = ewma_rate * dominant_ip_ratio
+                    dominant_rate_threshold = mean_r + 2.0 * sigma_r
+                    if ip_str not in ("Unknown", "0.0.0.0", "::") and dominant_ip_ratio >= 0.40 and dominant_rate >= dominant_rate_threshold:
+                        logging.warning(
+                            f"[!] Legitimate flash crowd dominant IP {ip_str} rate highly elevated "
+                            f"({dominant_rate:.2f} pps). Applying rate-limit (50pps cap) as precaution."
+                        )
+                        ratelimit_ip(ip_str)
 
             conn.close()
         except Exception as e:
@@ -945,6 +1118,10 @@ def main():
     # Start IPC socket listener thread
     ipc_thread = threading.Thread(target=run_ipc_receiver, daemon=True)
     ipc_thread.start()
+
+    # Start IPSET capacity monitor thread
+    monitor_thread = threading.Thread(target=run_ipset_monitor, daemon=True)
+    monitor_thread.start()
 
     # Start FastAPI / Uvicorn server synchronously on main thread
     start_api_server()
