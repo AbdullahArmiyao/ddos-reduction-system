@@ -1,10 +1,9 @@
 # Adaptive Two-Stage DDoS Mitigation Gateway
 
 **Author:** Abdullah Armiyao | ***REMOVED***  
-**Course:** ***REMOVED*** — ***REMOVED*** II | ***REMOVED***  
+**Course:** ***REMOVED*** II (***REMOVED***) | ***REMOVED***  
 **Project:** Adaptive Two-Stage Framework for Near Real-Time DDoS Mitigation Using Behavioral Traffic Analysis
 
----
 
 ## What This Project Is
 
@@ -17,7 +16,6 @@ The system is split into two stages:
 - **Stage 1 (Rust):** Sits inline on the network bridge, watches every packet, runs lightweight statistics, and raises an anomaly flag when something looks wrong.
 - **Stage 2 (Python, not yet built):** Wakes up only when Stage 1 flags something, runs a Random Forest classifier to confirm whether it's a real attack or a flash crowd, then issues kernel-level blocks via `ipset`.
 
----
 
 ## Network Topology and Virtualization Gotchas
 
