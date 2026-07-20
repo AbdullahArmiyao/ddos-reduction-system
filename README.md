@@ -261,10 +261,6 @@ The answer lies in the **Global Interpreter Lock (GIL)** and **runtime overhead*
 ```
 DDoS Reduction Project/
 ├── README.md                       ← this file
-├── attachments/
-│   ├── ***REMOVED***_copy.pdf              ← original assignment brief
-│   ├── Abdullah_Armiyao_***REMOVED***_Proposal_Rust.docx  ← submitted proposal
-│   └── Stage 1 in depth.txt       ← architecture design notes
 ├── stage1/                         ← Stage 1: Rust binary
 │   ├── Cargo.toml                  ← dependencies and build profile
 │   └── src/
