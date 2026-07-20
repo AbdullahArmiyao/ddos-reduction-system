@@ -1,7 +1,7 @@
 # Adaptive Two-Stage DDoS Mitigation Gateway
 
-**Author:** Abdullah Armiyao | ***REMOVED***  
-**Course:** ***REMOVED*** II (***REMOVED***) | ***REMOVED***  
+**Author:** Abdullah Armiyao 
+**Course:** ***REMOVED*** | ***REMOVED***  
 **Project:** Adaptive Two-Stage Framework for Near Real-Time DDoS Mitigation Using Behavioral Traffic Analysis
 
 
