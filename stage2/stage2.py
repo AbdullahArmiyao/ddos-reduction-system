@@ -49,7 +49,7 @@ from reportlab.lib import colors
 SOCKET_PATH = "/tmp/ddos_stage1.sock"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "ddos_rf_model.joblib")
-FEATURE_VECTOR_FORMAT = "<9d16s16s"  # 9 x f64 (72 bytes) + 16-byte dominant IP + 16-byte victim IP = 104 bytes
+FEATURE_VECTOR_FORMAT = "<15d16s16s"  # 15 x f64 (120 bytes) + 16-byte dominant IP + 16-byte victim IP = 152 bytes
 PAYLOAD_SIZE = struct.calcsize(FEATURE_VECTOR_FORMAT)
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(SCRIPT_DIR, "stage2.db"))
@@ -102,7 +102,13 @@ last_metrics = {
     "timestamp": 0.0,
     "k_multiplier": 2.0,
     "cooldown": 0,
-    "latest_classification": "Normal"
+    "latest_classification": "Normal",
+    "proto_tcp": 1.0,
+    "proto_udp": 0.0,
+    "proto_icmp": 0.0,
+    "proto_sctp": 0.0,
+    "proto_gre": 0.0,
+    "proto_esp": 0.0
 }
 last_metrics_by_target = {}  # victim_ip -> last_metrics dict
 
@@ -192,6 +198,27 @@ def setup_ipset():
 
 recently_blocked = {}
 
+def resolve_victim_ip(victim_ip=None):
+    if victim_ip and victim_ip not in ("Unknown", "0.0.0.0", "::"):
+        return victim_ip
+    
+    try:
+        if os.path.exists(VICTIMS_PATH):
+            with open(VICTIMS_PATH, "r") as f:
+                victims = json.load(f)
+                active_victims = [v["ip"] for v in victims if v.get("active")]
+                if active_victims:
+                    return active_victims[0]
+                if victims:
+                    return victims[0]["ip"]
+    except Exception:
+        pass
+
+    if last_metrics_by_target:
+        return next(iter(last_metrics_by_target.keys()))
+
+    return "10.0.0.3"
+
 def block_ip(ip, duration=3600, victim_ip="Unknown"):
     """Add offending IP to ddos_blocklist."""
     global recently_blocked
@@ -200,6 +227,7 @@ def block_ip(ip, duration=3600, victim_ip="Unknown"):
     if ip in recently_blocked and now - recently_blocked[ip] < 10.0:
         return
         
+    victim_ip = resolve_victim_ip(victim_ip)
     try:
         # Check whitelist bypass
         whitelist = load_json_file(WHITELIST_PATH, [])
@@ -231,6 +259,7 @@ def ratelimit_ip(ip, duration=3600, victim_ip="Unknown"):
     if ip in recently_blocked and now - recently_blocked[ip] < 10.0:
         return
         
+    victim_ip = resolve_victim_ip(victim_ip)
     try:
         # Check whitelist bypass
         whitelist = load_json_file(WHITELIST_PATH, [])
@@ -372,12 +401,13 @@ def decode_ip(ip_bytes):
 # -----------------------------------------------------------------------------
 
 def log_incident(timestamp, src_ip, classification, victim_ip="Unknown"):
+    victim_ip = resolve_victim_ip(victim_ip)
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO logs (timestamp, src_ip, dst_ip, proto, rate, entropy, classification) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (timestamp, src_ip, victim_ip, "MIXED", last_metrics["ewma_rate"], last_metrics["entropy"], classification)
+            (timestamp, src_ip, victim_ip, "MIXED", last_metrics.get("ewma_rate", 0.0), last_metrics.get("entropy", 0.0), classification)
         )
         # Purge old logs to prevent size explosion (keep last 5000)
         cursor.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 5000)")
@@ -465,8 +495,15 @@ def run_ipc_receiver():
                 proto_ratio = unpacked[6]
                 dominant_ip_ratio = unpacked[7]
                 timestamp = unpacked[8]
-                ip_str = decode_ip(unpacked[9])
-                victim_ip_str = decode_ip(unpacked[10])
+                proto_tcp = unpacked[9]
+                proto_udp = unpacked[10]
+                proto_icmp = unpacked[11]
+                proto_sctp = unpacked[12]
+                proto_gre = unpacked[13]
+                proto_esp = unpacked[14]
+                ip_str = decode_ip(unpacked[15])
+                victim_ip_str = decode_ip(unpacked[16])
+                victim_ip_str = resolve_victim_ip(victim_ip_str)
 
                 # Calculate delta features
                 delta_rate = ewma_rate - mean_r
@@ -517,7 +554,13 @@ def run_ipc_receiver():
                     "k_multiplier": 2.0,
                     "cooldown": 0,
                     "latest_classification": pred_name,
-                    "victim_ip": victim_ip_str
+                    "victim_ip": victim_ip_str,
+                    "proto_tcp": proto_tcp,
+                    "proto_udp": proto_udp,
+                    "proto_icmp": proto_icmp,
+                    "proto_sctp": proto_sctp,
+                    "proto_gre": proto_gre,
+                    "proto_esp": proto_esp
                 }
                 last_metrics_by_target[victim_ip_str] = last_metrics.copy()
 
@@ -748,8 +791,8 @@ def get_state(target: Optional[str] = None):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, src_ip, classification FROM logs ORDER BY id DESC LIMIT 5")
-        latest_logs = [{"timestamp": r[0], "src_ip": r[1], "classification": r[2]} for r in cursor.fetchall()]
+        cursor.execute("SELECT timestamp, src_ip, dst_ip, classification FROM logs ORDER BY id DESC LIMIT 5")
+        latest_logs = [{"timestamp": r[0], "src_ip": r[1], "victim_ip": r[2], "classification": r[3]} for r in cursor.fetchall()]
         conn.close()
     except Exception:
         pass
@@ -784,7 +827,13 @@ def get_state(target: Optional[str] = None):
             "k_multiplier": 2.0,
             "cooldown": 0,
             "latest_classification": "Normal",
-            "victim_ip": target
+            "victim_ip": target,
+            "proto_tcp": 1.0,
+            "proto_udp": 0.0,
+            "proto_icmp": 0.0,
+            "proto_sctp": 0.0,
+            "proto_gre": 0.0,
+            "proto_esp": 0.0
         })
     elif last_metrics_by_target:
         first_target = next(iter(last_metrics_by_target.keys()))
@@ -845,6 +894,7 @@ def get_history(target: Optional[str] = None):
 # Whitelist endpoints
 class IpPayload(BaseModel):
     ip: str
+    victim_ip: Optional[str] = None
 
 @app.post("/api/whitelist")
 def add_whitelist(payload: IpPayload):
@@ -896,7 +946,7 @@ def toggle_victim(ip: str):
 # Firewall blocks endpoints
 @app.post("/api/firewall/block")
 def manual_block(payload: IpPayload):
-    block_ip(payload.ip, duration=600)
+    block_ip(payload.ip, duration=600, victim_ip=payload.victim_ip)
     return {"status": "success"}
 
 @app.post("/api/firewall/unblock")
@@ -1074,22 +1124,23 @@ def export_pdf(payload: PdfReportPayload):
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, src_ip, rate, entropy, classification FROM logs ORDER BY id DESC LIMIT 5")
+        cursor.execute("SELECT timestamp, src_ip, dst_ip, rate, entropy, classification FROM logs ORDER BY id DESC LIMIT 5")
         rows = cursor.fetchall()
         conn.close()
 
-        log_table_data = [["TIMESTAMP", "SOURCE IP", "RATE", "ENTROPY", "CLASSIFICATION"]]
+        log_table_data = [["TIMESTAMP", "SOURCE IP", "VICTIM IP", "RATE", "ENTROPY", "CLASSIFICATION"]]
         for r in rows:
             date_str = time.strftime('%H:%M:%S', time.localtime(r[0]))
             log_table_data.append([
                 date_str,
                 r[1],
-                f"{r[2]:.1f} pps",
-                f"{r[3]:.4f}",
-                r[4].upper()
+                r[2],
+                f"{r[3]:.1f} pps",
+                f"{r[4]:.4f}",
+                r[5].upper()
             ])
             
-        t_logs = Table(log_table_data, colWidths=[100, 120, 100, 100, 120])
+        t_logs = Table(log_table_data, colWidths=[80, 100, 100, 80, 80, 100])
         t_logs.setStyle(TableStyle([
             ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#00a2b0')),
             ('TEXTCOLOR', (0,0), (-1,0), colors.white),

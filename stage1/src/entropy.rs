@@ -1,12 +1,28 @@
 // =============================================================================
-// entropy.rs — Shannon Source-IP Entropy Calculator
+// entropy.rs — Normalized Shannon Source-IP Entropy Calculator
 // =============================================================================
 //
 // PURPOSE
 // -------
-// Computes the Shannon Entropy of the source IP distribution inside one
-// 50-packet window.  The resulting scalar `h` is the "diversity score" that
+// Computes the Normalized Shannon Entropy of the source IP distribution inside
+// one analysis window.  The resulting scalar `h` is the "diversity score" that
 // flows into the Welford accumulator (Layer 2 → Layer 3) after every window.
+//
+// WHY NORMALIZED ENTROPY?
+// -------------------------
+// With hybrid time-gated windowing, window sizes vary with traffic rate:
+// a peacetime window might contain 50 packets, a flood window 15,000.
+// Raw Shannon entropy's ceiling is log₂(N) where N = unique sources, but
+// the *number of unique sources observable* depends on window size, creating
+// a confound between diversity and volume.
+//
+// Normalized entropy H_norm = H(X) / log₂(|unique IPs|) produces a [0, 1]
+// scalar that measures concentration independently of window size:
+//   0.0 = total concentration (all packets from one IP)
+//   1.0 = perfectly even distribution across all observed IPs
+//
+// Guard: if unique_sources ≤ 1, return 0.0 without dividing (avoids
+// log₂(1) = 0 → NaN).
 //
 // WHY ENTROPY, NOT UNIQUE IP COUNT?
 // ------------------------------------
@@ -17,9 +33,9 @@
 //   Window B: 10 unique IPs, each appears 5 times  → even spread → normal
 //
 // Shannon Entropy H(X) = −Σ p(x)·log₂p(x) captures the full *shape* of the
-// probability distribution, not just its cardinality.  It returns a single
-// scalar between 0.0 (total concentration) and log₂(n) ≈ 5.64 bits (50
-// perfectly distinct IPs), giving Layer 3 a meaningful quantity to compare.
+// probability distribution, not just its cardinality.  Normalizing by the
+// maximum achievable entropy (log₂ of unique count) gives a single scalar
+// between 0.0 and 1.0.
 //
 // RESET BEHAVIOUR
 // ----------------
@@ -31,46 +47,48 @@
 // IMPLEMENTATION NOTES
 // ----------------------
 // • Uses `std::collections::HashMap<IpAddr, u32>` for frequency counting.
-// • Recomputes from scratch each window — this is O(n) in window size (50
-//   packets), which is negligible. No incremental update needed.
+// • Recomputes from scratch each window — this is O(n) in window size,
+//   which is negligible. No incremental update needed.
 // • Uses only standard library: `HashMap`, `f64::log2()`.  No external crates.
 // • BPF filter (`dst host <victim_ip>`) is applied at the `pcap` level before
 //   this module ever sees a packet, so all IPs counted here are *source* IPs
 //   of inbound traffic only.
+// • Window size is no longer fixed — the accumulator accepts an unlimited
+//   number of packets per window.  The close decision lives in analysis.rs.
 //
 // RANGE REFERENCE
 // ----------------
-//   Window size = 50 packets (WINDOW_SIZE constant)
-//   Minimum entropy = 0.0   (all 50 packets from one IP)
-//   Maximum entropy ≈ 5.64  (50 packets from 50 unique IPs, log₂(50))
+//   Normalized entropy range: [0.0, 1.0]
+//     0.0 = all packets from one IP (or ≤1 unique source)
+//     1.0 = perfectly even distribution across all unique IPs
 // =============================================================================
 
 use std::{collections::HashMap, net::IpAddr};
 
-/// Number of packets per analysis window.
-///
-/// This constant is the single source of truth for window sizing across the
-/// entire Stage 1 codebase. Both the entropy calculator and the main capture
-/// loop use it to decide when a window has closed.
-pub const WINDOW_SIZE: usize = 50;
+/// Minimum number of packets required for a statistically meaningful entropy
+/// calculation.  Windows closing with fewer packets than this (e.g. during
+/// the 1.0s hard-cap in very low traffic) should be treated with caution.
+pub const MIN_PACKETS_FOR_ENTROPY: usize = 20;
 
 // -----------------------------------------------------------------------------
 // EntropyAccumulator
 // -----------------------------------------------------------------------------
 
-/// Accumulates source IPs over one window and computes Shannon Entropy on close.
+/// Accumulates source IPs over one window and computes Normalized Shannon
+/// Entropy on close.
 ///
 /// Lifecycle per window:
-///   1. Call `add_packet(src_ip)` for each of the 50 arriving packets.
-///   2. When `is_window_full()` returns `true`, call `compute_and_reset()`.
-///   3. The returned `f64` is the entropy scalar `h` to pass to Welford.
+///   1. Call `add_packet(src_ip)` for each arriving packet (no cap).
+///   2. When the analysis loop's close condition fires, call
+///      `compute_and_reset()`.
+///   3. The returned `f64` is the normalized entropy scalar `h` ∈ [0, 1].
 ///   4. The HashMap and counter are cleared internally by `compute_and_reset()`.
 #[derive(Debug, Default)]
 pub struct EntropyAccumulator {
     /// Frequency count of each unique source IP seen in the current window.
     /// Cleared after every `compute_and_reset()` call.
     counts: HashMap<IpAddr, u32>,
-    /// Number of packets accumulated in the current window (0..=WINDOW_SIZE).
+    /// Number of packets accumulated in the current window (unbounded).
     packet_count: usize,
 }
 
@@ -83,33 +101,27 @@ impl EntropyAccumulator {
     /// Record one packet's source IP in the current window.
     ///
     /// Must be called per-packet from the analysis thread's main loop.
-    /// Silently ignores calls once `WINDOW_SIZE` is reached — the caller
-    /// should check `is_window_full()` first and call `compute_and_reset()`
-    /// before ingesting the next packet.
+    /// There is no cap — the accumulator grows dynamically.  The close
+    /// decision is made by the analysis loop based on elapsed time and
+    /// minimum packet count, not by this accumulator.
     pub fn add_packet(&mut self, src_ip: IpAddr) {
-        if self.packet_count < WINDOW_SIZE {
-            // Increment the count for this IP (or insert 1 if first time seen).
-            *self.counts.entry(src_ip).or_insert(0) += 1;
-            self.packet_count += 1;
-        }
+        *self.counts.entry(src_ip).or_insert(0) += 1;
+        self.packet_count += 1;
     }
 
-    /// Returns `true` when exactly `WINDOW_SIZE` packets have been recorded.
-    pub fn is_window_full(&self) -> bool {
-        self.packet_count >= WINDOW_SIZE
-    }
-
-    /// Compute Shannon Entropy over the current window, then reset state.
+    /// Compute Normalized Shannon Entropy over the current window, then
+    /// reset state.
     ///
     /// # Returns
-    /// The entropy scalar `h` in bits (range `[0.0, log₂(WINDOW_SIZE)]`).
-    /// Returns `0.0` if the window is empty (should not happen in normal use).
+    /// The normalized entropy scalar `h` in range `[0.0, 1.0]`.
+    /// Returns `0.0` if the window has ≤1 unique source (guard against
+    /// division by log₂(1) = 0).
     ///
     /// # Side Effect
     /// Clears `self.counts` and resets `self.packet_count` to zero so the
-    /// accumulator is ready for the next 50-packet window immediately.
+    /// accumulator is ready for the next window immediately.
     pub fn compute_and_reset(&mut self) -> f64 {
-        let h = compute_entropy(&self.counts, self.packet_count);
+        let h = compute_normalized_entropy(&self.counts, self.packet_count);
         // Reset for next window — O(capacity) clear keeps the HashMap allocation
         // alive to avoid repeated heap allocations across windows.
         self.counts.clear();
@@ -118,8 +130,7 @@ impl EntropyAccumulator {
     }
 
     /// Peek at the current packet count without consuming the window.
-    /// Useful for the analysis thread's progress logging.
-    #[allow(dead_code)]
+    /// Useful for the analysis thread's progress logging and close decisions.
     pub fn packet_count(&self) -> usize {
         self.packet_count
     }
@@ -129,11 +140,13 @@ impl EntropyAccumulator {
 // Core entropy computation (pure function — testable without network traffic)
 // -----------------------------------------------------------------------------
 
-/// Compute Shannon Entropy from a frequency map and total packet count.
+/// Compute Normalized Shannon Entropy from a frequency map and total packet
+/// count.
 ///
-/// H(X) = −Σ p(xᵢ) · log₂(p(xᵢ))
+/// H_norm = H(X) / log₂(|unique IPs|)
 ///
-/// where p(xᵢ) = count(xᵢ) / total_packets
+/// where H(X) = −Σ p(xᵢ) · log₂(p(xᵢ))
+///       p(xᵢ) = count(xᵢ) / total_packets
 ///
 /// This is a standalone pure function so unit tests can drive it directly
 /// with crafted frequency maps without needing an `EntropyAccumulator`.
@@ -143,15 +156,24 @@ impl EntropyAccumulator {
 /// * `total_packets`— Total number of packets in the window (= Σ counts).
 ///
 /// # Returns
-/// Entropy in bits.  Returns `0.0` if `total_packets` is 0.
-pub fn compute_entropy(counts: &HashMap<IpAddr, u32>, total_packets: usize) -> f64 {
+/// Normalized entropy in [0.0, 1.0].
+/// Returns `0.0` if `total_packets` is 0 or if there is only 1 unique source.
+pub fn compute_normalized_entropy(counts: &HashMap<IpAddr, u32>, total_packets: usize) -> f64 {
     if total_packets == 0 {
+        return 0.0;
+    }
+
+    let unique_sources = counts.len();
+
+    // Guard: ≤1 unique source → entropy is definitionally 0.0.
+    // Also avoids log₂(1) = 0.0 → division by zero.
+    if unique_sources <= 1 {
         return 0.0;
     }
 
     let n = total_packets as f64;
 
-    counts
+    let raw_entropy: f64 = counts
         .values()
         .filter(|&&c| c > 0) // defensive: skip zero-count entries
         .map(|&c| {
@@ -161,7 +183,12 @@ pub fn compute_entropy(counts: &HashMap<IpAddr, u32>, total_packets: usize) -> f
             // log₂(0) would be −∞, but p > 0 is guaranteed by the filter above.
             -p * p.log2()
         })
-        .sum()
+        .sum();
+
+    // Normalize by maximum achievable entropy for this many unique sources.
+    let max_entropy = (unique_sources as f64).log2();
+
+    raw_entropy / max_entropy
 }
 
 // =============================================================================
@@ -179,7 +206,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // compute_entropy pure function tests
+    // compute_normalized_entropy pure function tests
     // -------------------------------------------------------------------------
 
     /// All packets from a single IP → entropy must be exactly 0.0.
@@ -187,38 +214,50 @@ mod tests {
     fn single_source_zero_entropy() {
         let mut counts = HashMap::new();
         counts.insert(ip(1, 0, 0, 1), 50);
-        let h = compute_entropy(&counts, 50);
+        let h = compute_normalized_entropy(&counts, 50);
         assert!(
             h.abs() < 1e-10,
             "single-source entropy should be 0.0, got {h}"
         );
     }
 
-    /// All 50 packets from 50 unique IPs → maximum entropy ≈ log₂(50) ≈ 5.644.
+    /// All 50 packets from 50 unique IPs → maximum normalized entropy = 1.0.
     #[test]
     fn uniform_distribution_maximum_entropy() {
         let mut counts = HashMap::new();
         for i in 0..50_u8 {
             counts.insert(ip(10, 0, 0, i), 1);
         }
-        let h        = compute_entropy(&counts, 50);
-        let expected = (50_f64).log2(); // ≈ 5.6439
+        let h = compute_normalized_entropy(&counts, 50);
         assert!(
-            (h - expected).abs() < 1e-6,
-            "uniform entropy mismatch: expected {expected:.6}, got {h:.6}"
+            (h - 1.0).abs() < 1e-6,
+            "uniform normalized entropy should be 1.0, got {h:.6}"
         );
     }
 
-    /// Two equally likely IPs → entropy = log₂(2) = 1.0 exactly.
+    /// Two equally likely IPs → normalized entropy = 1.0 (maximum for 2 sources).
     #[test]
-    fn two_equal_sources_one_bit() {
+    fn two_equal_sources_normalized_one() {
         let mut counts = HashMap::new();
         counts.insert(ip(192, 168, 1, 1), 25);
         counts.insert(ip(192, 168, 1, 2), 25);
-        let h = compute_entropy(&counts, 50);
+        let h = compute_normalized_entropy(&counts, 50);
         assert!(
             (h - 1.0).abs() < 1e-10,
-            "expected exactly 1.0 bit, got {h}"
+            "expected normalized 1.0 for 2 equal sources, got {h}"
+        );
+    }
+
+    /// Two sources, one dominant (49 vs 1) → low normalized entropy.
+    #[test]
+    fn two_sources_skewed_low_entropy() {
+        let mut counts = HashMap::new();
+        counts.insert(ip(10, 0, 0, 1), 49);
+        counts.insert(ip(10, 0, 0, 2), 1);
+        let h = compute_normalized_entropy(&counts, 50);
+        assert!(
+            h > 0.0 && h < 0.2,
+            "skewed 2-source entropy should be low but non-zero, got {h}"
         );
     }
 
@@ -226,45 +265,75 @@ mod tests {
     #[test]
     fn empty_window_returns_zero() {
         let counts = HashMap::new();
-        let h = compute_entropy(&counts, 0);
+        let h = compute_normalized_entropy(&counts, 0);
         assert_eq!(h, 0.0);
+    }
+
+    /// Large window (15,000 packets) from 50 uniform sources → still 1.0.
+    /// This verifies normalization decouples entropy from window size.
+    #[test]
+    fn large_window_uniform_still_one() {
+        let mut counts = HashMap::new();
+        for i in 0..50_u8 {
+            counts.insert(ip(10, 0, 0, i), 300); // 50 × 300 = 15,000
+        }
+        let h = compute_normalized_entropy(&counts, 15_000);
+        assert!(
+            (h - 1.0).abs() < 1e-6,
+            "large-window uniform normalized entropy should be 1.0, got {h:.6}"
+        );
+    }
+
+    /// Same 50 sources in small (50-pkt) and large (15,000-pkt) windows
+    /// must produce the same normalized entropy — proving rate independence.
+    #[test]
+    fn entropy_is_rate_independent() {
+        let mut counts_small = HashMap::new();
+        let mut counts_large = HashMap::new();
+        for i in 0..50_u8 {
+            counts_small.insert(ip(10, 0, 0, i), 1);
+            counts_large.insert(ip(10, 0, 0, i), 300);
+        }
+        let h_small = compute_normalized_entropy(&counts_small, 50);
+        let h_large = compute_normalized_entropy(&counts_large, 15_000);
+        assert!(
+            (h_small - h_large).abs() < 1e-6,
+            "entropy should be rate-independent: small={h_small:.6}, large={h_large:.6}"
+        );
     }
 
     // -------------------------------------------------------------------------
     // EntropyAccumulator integration tests
     // -------------------------------------------------------------------------
 
-    /// Window fills correctly and compute_and_reset returns expected scalar.
+    /// Window fills and compute_and_reset returns expected scalar.
     #[test]
     fn accumulator_fills_and_resets() {
         let mut acc = EntropyAccumulator::new();
 
-        // Feed 50 packets from 2 IPs (25 each) → should return 1.0 bit.
+        // Feed 50 packets from 2 IPs (25 each) → normalized = 1.0 for 2 sources.
         for i in 0..50 {
             let src = if i < 25 { ip(10, 0, 0, 1) } else { ip(10, 0, 0, 2) };
             acc.add_packet(src);
         }
 
-        assert!(acc.is_window_full());
         let h = acc.compute_and_reset();
-        assert!((h - 1.0).abs() < 1e-10, "expected 1.0 bit, got {h}");
+        assert!((h - 1.0).abs() < 1e-10, "expected 1.0, got {h}");
 
         // After reset: window must be empty and ready for next window.
         assert_eq!(acc.packet_count(), 0);
-        assert!(!acc.is_window_full());
     }
 
-    /// Calls beyond WINDOW_SIZE are silently dropped (no panic, no over-count).
+    /// Accumulator accepts more than 50 packets (no cap).
     #[test]
-    fn extra_packets_are_dropped() {
+    fn no_packet_cap() {
         let mut acc = EntropyAccumulator::new();
         let src = ip(172, 16, 0, 1);
-        for _ in 0..60 {
-            // Feed 10 extra packets beyond the window
+        for _ in 0..200 {
             acc.add_packet(src);
         }
-        // Packet count must not exceed WINDOW_SIZE.
-        assert_eq!(acc.packet_count(), WINDOW_SIZE);
+        // All 200 packets should be counted.
+        assert_eq!(acc.packet_count(), 200);
     }
 
     /// Back-to-back windows work correctly (reset clears state fully).
@@ -273,20 +342,20 @@ mod tests {
         let mut acc = EntropyAccumulator::new();
 
         // Window 1: all from one IP → entropy = 0.
-        for _ in 0..WINDOW_SIZE {
+        for _ in 0..50 {
             acc.add_packet(ip(1, 1, 1, 1));
         }
         let h1 = acc.compute_and_reset();
         assert!(h1.abs() < 1e-10, "window 1 entropy should be 0.0, got {h1}");
 
-        // Window 2: uniform 50 unique IPs → entropy ≈ 5.644.
+        // Window 2: uniform 50 unique IPs → entropy = 1.0.
         for i in 0..50_u8 {
             acc.add_packet(ip(2, 0, 0, i));
         }
         let h2 = acc.compute_and_reset();
         assert!(
-            h2 > 5.0,
-            "window 2 entropy should be near 5.644, got {h2}"
+            (h2 - 1.0).abs() < 1e-6,
+            "window 2 normalized entropy should be 1.0, got {h2}"
         );
     }
 }

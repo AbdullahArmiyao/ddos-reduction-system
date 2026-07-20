@@ -130,6 +130,12 @@ success "Build complete."
 if [[ -d "$STAGE2_DIR" ]]; then
     info "Updating Stage 2 Python dependencies..."
     if [[ -d "$STAGE2_DIR/venv" ]]; then
+        # Check if the python interpreter path is valid/executable
+        if ! "$STAGE2_DIR/venv/bin/python" -c "import sys" &>/dev/null; then
+            warn "Virtual environment is broken, moved, or invalid. Re-creating..."
+            python3 -m venv --clear "$STAGE2_DIR/venv"
+        fi
+        
         "$STAGE2_DIR/venv/bin/pip" install --upgrade pip
         "$STAGE2_DIR/venv/bin/pip" install -r "$STAGE2_DIR/requirements.txt"
         

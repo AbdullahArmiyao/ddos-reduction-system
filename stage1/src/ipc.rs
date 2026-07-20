@@ -68,9 +68,9 @@ use std::{
 pub const SOCKET_PATH: &str = "/tmp/ddos_stage1.sock";
 
 /// Wire size of one serialised `FeatureVector` in bytes.
-/// 9 fields × 8 bytes (f64) = 72 bytes + 16 bytes for dominant IP + 16 bytes for victim IP = 104 bytes.
-/// Python format: `struct.unpack('<9d16s16s', data)`
-pub const FEATURE_VECTOR_BYTES: usize = 104;
+/// 15 fields × 8 bytes (f64) = 120 bytes + 16 bytes for dominant IP + 16 bytes for victim IP = 152 bytes.
+/// Python format: `struct.unpack('<15d16s16s', data)`
+pub const FEATURE_VECTOR_BYTES: usize = 152;
 
 /// Anomaly flag: EWMA rate exceeded upper boundary (volume flood).
 /// Retained as a logging constant — no longer sent in the wire payload.
@@ -86,8 +86,8 @@ pub const FLAG_ENTROPY_ANOMALY: u8 = 0x02;
 
 /// The data payload handed to Stage 2 after every anomalous window.
 ///
-/// Wire format: 9 × f64 (little-endian) + 16 bytes dominant IP + 16 bytes victim IP = 104 bytes total.
-/// Python unpacks with: `struct.unpack('<9d16s16s', data)`
+/// Wire format: 15 × f64 (little-endian) + 16 bytes dominant IP + 16 bytes victim IP = 152 bytes total.
+/// Python unpacks with: `struct.unpack('<15d16s16s', data)`
 ///
 /// Field order matches the Python unpack string exactly — **do not reorder**.
 #[derive(Debug, Clone)]
@@ -104,12 +104,24 @@ pub struct FeatureVector {
     pub sigma_h: f64,
     /// Rate standard deviation (Welford).
     pub sigma_r: f64,
-    /// Fraction of window packets that were TCP (0.0 = all UDP/ICMP, 1.0 = all TCP).
+    /// Legacy/ML proto_ratio: fraction of window packets that were TCP.
     pub proto_ratio: f64,
     /// Fraction of packets from the busiest IP.
     pub dominant_ip_ratio: f64,
     /// Wall-clock time of this window close (seconds since UNIX epoch).
     pub timestamp: f64,
+    /// Ratio of TCP packets in window.
+    pub proto_tcp: f64,
+    /// Ratio of UDP packets in window.
+    pub proto_udp: f64,
+    /// Ratio of ICMP packets in window.
+    pub proto_icmp: f64,
+    /// Ratio of SCTP packets in window.
+    pub proto_sctp: f64,
+    /// Ratio of GRE packets in window.
+    pub proto_gre: f64,
+    /// Ratio of ESP packets in window.
+    pub proto_esp: f64,
     /// The dominant IP address in this window (used for mitigation blocks).
     pub dominant_ip: std::net::IpAddr,
     /// The victim destination IP address.
@@ -120,10 +132,10 @@ impl FeatureVector {
     /// Serialise the feature vector into a fixed-size byte buffer.
     ///
     /// All numeric fields are written as **little-endian f64** to match
-    /// Python's `struct.unpack('<9d16s16s', data)` format string exactly.
+    /// Python's `struct.unpack('<15d16s16s', data)` format string exactly.
     ///
     /// # Returns
-    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 104 bytes, no padding, no surprises.
+    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 152 bytes, no padding, no surprises.
     pub fn to_bytes(&self) -> [u8; FEATURE_VECTOR_BYTES] {
         let mut buf = Vec::with_capacity(FEATURE_VECTOR_BYTES);
 
@@ -146,6 +158,18 @@ impl FeatureVector {
             .expect("write dom_ratio");
         buf.write_f64::<LittleEndian>(self.timestamp)
             .expect("write timestamp");
+        buf.write_f64::<LittleEndian>(self.proto_tcp)
+            .expect("write proto_tcp");
+        buf.write_f64::<LittleEndian>(self.proto_udp)
+            .expect("write proto_udp");
+        buf.write_f64::<LittleEndian>(self.proto_icmp)
+            .expect("write proto_icmp");
+        buf.write_f64::<LittleEndian>(self.proto_sctp)
+            .expect("write proto_sctp");
+        buf.write_f64::<LittleEndian>(self.proto_gre)
+            .expect("write proto_gre");
+        buf.write_f64::<LittleEndian>(self.proto_esp)
+            .expect("write proto_esp");
 
         // Serialize dominant_ip as 16 bytes (IPv6 or IPv6-mapped IPv4 address)
         let ip_v6 = match self.dominant_ip {
@@ -284,6 +308,12 @@ mod tests {
             proto_ratio: 0.72,
             dominant_ip_ratio: 0.66,
             timestamp:   1_700_000_000.0,
+            proto_tcp:   0.60,
+            proto_udp:   0.20,
+            proto_icmp:  0.10,
+            proto_sctp:  0.05,
+            proto_gre:   0.03,
+            proto_esp:   0.02,
             dominant_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 4)),
             victim_ip:   std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 3)),
         }
@@ -294,7 +324,7 @@ mod tests {
     fn serialised_size_is_correct() {
         let bytes = sample_fv().to_bytes();
         assert_eq!(bytes.len(), FEATURE_VECTOR_BYTES);
-        assert_eq!(FEATURE_VECTOR_BYTES, 104);
+        assert_eq!(FEATURE_VECTOR_BYTES, 152);
     }
 
     /// Round-trip: serialise then re-parse with byteorder.
@@ -317,6 +347,12 @@ mod tests {
         let proto_ratio       = cur.read_f64::<LittleEndian>().unwrap();
         let dominant_ip_ratio = cur.read_f64::<LittleEndian>().unwrap();
         let timestamp         = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_tcp         = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_udp         = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_icmp        = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_sctp        = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_gre         = cur.read_f64::<LittleEndian>().unwrap();
+        let proto_esp         = cur.read_f64::<LittleEndian>().unwrap();
 
         let mut ip_bytes = [0u8; 16];
         std::io::Read::read_exact(&mut cur, &mut ip_bytes).unwrap();
@@ -335,6 +371,12 @@ mod tests {
         assert!((proto_ratio       - 0.72            ).abs() < 1e-9);
         assert!((dominant_ip_ratio - 0.66            ).abs() < 1e-9);
         assert!((timestamp         - 1_700_000_000.0 ).abs() < 1e-3);
+        assert!((proto_tcp         - 0.60            ).abs() < 1e-9);
+        assert!((proto_udp         - 0.20            ).abs() < 1e-9);
+        assert!((proto_icmp        - 0.10            ).abs() < 1e-9);
+        assert!((proto_sctp        - 0.05            ).abs() < 1e-9);
+        assert!((proto_gre         - 0.03            ).abs() < 1e-9);
+        assert!((proto_esp         - 0.02            ).abs() < 1e-9);
         assert_eq!(dominant_ip, std::net::IpAddr::V6(std::net::Ipv4Addr::new(192, 168, 1, 4).to_ipv6_mapped()));
         assert_eq!(victim_ip, std::net::IpAddr::V6(std::net::Ipv4Addr::new(10, 0, 0, 3).to_ipv6_mapped()));
     }

@@ -80,9 +80,10 @@ pub const CHANNEL_CAPACITY: usize = 1024;
 pub enum Protocol {
     Tcp,
     Udp,
-    /// ICMP (IPv4) or ICMPv6.
     Icmp,
-    /// Any other IP protocol number (ESP, GRE, SCTP, …).
+    Sctp,
+    Gre,
+    Esp,
     Other,
 }
 
@@ -323,23 +324,31 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
         // -------------------------------------------------------------------------
         // Step 5: Extract source and destination IPs from the IP header.
         // -------------------------------------------------------------------------
-        let (src_ip, dst_ip) = match sliced.net {
+        let (src_ip, dst_ip, ip_num) = match sliced.net {
             Some(InternetSlice::Ipv4(ref ipv4)) => {
-                (IpAddr::from(ipv4.header().source_addr()), IpAddr::from(ipv4.header().destination_addr()))
+                (IpAddr::from(ipv4.header().source_addr()), IpAddr::from(ipv4.header().destination_addr()), ipv4.header().protocol())
             }
             Some(InternetSlice::Ipv6(ref ipv6)) => {
-                (IpAddr::from(ipv6.header().source_addr()), IpAddr::from(ipv6.header().destination_addr()))
+                (IpAddr::from(ipv6.header().source_addr()), IpAddr::from(ipv6.header().destination_addr()), ipv6.header().next_header())
             }
             // Non-IP frame (ARP, etc.) — ignore.
             _ => continue,
         };
 
-        let (protocol, dst_port) = match sliced.transport {
-            Some(TransportSlice::Tcp(ref slice)) => (Protocol::Tcp, slice.destination_port()),
-            Some(TransportSlice::Udp(ref slice)) => (Protocol::Udp, slice.destination_port()),
-            Some(TransportSlice::Icmpv4(_))       => (Protocol::Icmp, 0),
-            Some(TransportSlice::Icmpv6(_))       => (Protocol::Icmp, 0),
-            _                                     => (Protocol::Other, 0),
+        let dst_port = match sliced.transport {
+            Some(TransportSlice::Tcp(ref slice)) => slice.destination_port(),
+            Some(TransportSlice::Udp(ref slice)) => slice.destination_port(),
+            _                                     => 0,
+        };
+
+        let protocol = match ip_num.0 {
+            6 => Protocol::Tcp,
+            17 => Protocol::Udp,
+            1 | 58 => Protocol::Icmp,
+            132 => Protocol::Sctp,
+            47 => Protocol::Gre,
+            50 => Protocol::Esp,
+            _ => Protocol::Other,
         };
 
         packet_count += 1;

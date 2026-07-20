@@ -112,7 +112,7 @@ Then: `variance = M2 / (n - 1)`
 
 **Recency cap:** After weeks of running, `n` becomes enormous and `delta/n ≈ 0`, freezing the mean. The implementation caps `n` at 500 so the algorithm stays sensitive to recent traffic patterns.
 
-**Warm-up:** The first 30 windows are discarded from anomaly evaluation. Welford's variance is meaningless on 2–3 samples.
+**Warm-up:** The first 200 windows are discarded from anomaly evaluation. Welford's variance is meaningless on 2–3 samples.
 
 **Golden test:** `[4, 7, 13, 16]` → mean = 10.0, variance = 30.0 exactly.
 
@@ -198,7 +198,7 @@ Stage 2 uses this flag plus four additional features in the Random Forest to mak
 
 When Stage 1 flags an anomaly, it serialises a `FeatureVector` struct and sends it over a Unix Domain Socket to Stage 2 (Python).
 
-The wire format is **exactly 88 bytes, little-endian**:
+The wire format is **exactly 152 bytes, little-endian**:
 
 | Offset | Size | Field | Type | Description |
 |---|---|---|---|---|
@@ -208,12 +208,19 @@ The wire format is **exactly 88 bytes, little-endian**:
 | 24 | 8 bytes | `mean_r` | f64 | Running mean of EWMA rate |
 | 32 | 8 bytes | `sigma_h` | f64 | Standard deviation of entropy |
 | 40 | 8 bytes | `sigma_r` | f64 | Standard deviation of EWMA rate |
-| 48 | 8 bytes | `proto_ratio` | f64 | TCP packet ratio (vs UDP/ICMP) |
+| 48 | 8 bytes | `proto_ratio` | f64 | TCP packet ratio (legacy) |
 | 56 | 8 bytes | `dominant_ip_ratio` | f64 | Ratio of packets from busiest IP |
 | 64 | 8 bytes | `timestamp` | f64 | UNIX timestamp of window close |
-| 72 | 16 bytes | `dominant_ip` | [u8; 16] | Busiest source IP (IPv6 or mapped IPv4) |
+| 72 | 8 bytes | `proto_tcp` | f64 | TCP packet ratio |
+| 80 | 8 bytes | `proto_udp` | f64 | UDP packet ratio |
+| 88 | 8 bytes | `proto_icmp` | f64 | ICMP packet ratio |
+| 96 | 8 bytes | `proto_sctp` | f64 | SCTP packet ratio |
+| 104 | 8 bytes | `proto_gre` | f64 | GRE packet ratio |
+| 112 | 8 bytes | `proto_esp` | f64 | ESP packet ratio |
+| 120 | 16 bytes | `dominant_ip` | [u8; 16] | Busiest source IP (IPv6 or mapped IPv4) |
+| 136 | 16 bytes | `victim_ip` | [u8; 16] | Monitored victim IP address |
 
-Python unpacks it with: `struct.unpack('<9d16s', data)`
+Python unpacks it with: `struct.unpack('<15d16s16s', data)`
 
 Fields are written manually with `byteorder` rather than transmuting the Rust struct directly. This eliminates invisible padding bugs — Rust structs can insert alignment padding that `struct.unpack` wouldn't know about.
 
@@ -285,16 +292,21 @@ DDoS Reduction Project/
 ### Linux (Debian/Ubuntu, RHEL/Fedora, Alpine)
 
 ```bash
-sudo bash scripts/install.sh --interface ens19 --victim-ip 10.0.0.3
+# Installs interactively (prompts for interface and targets if run in a terminal):
+sudo bash scripts/install.sh
+
+# Or install non-interactively using explicit targets:
+sudo bash scripts/install.sh --interface ens19 --victim-ips 10.0.0.3,10.0.0.4 --victim-subnet 10.0.0.0/24
 ```
 
 This will:
 1. Detect your OS and install `libpcap-dev` + build tools
-2. Install Rust via `rustup` if not present
-3. Compile Stage 1 in release mode
-4. Install the binary to `/usr/local/bin/ddos_stage1`
-5. Grant `CAP_NET_RAW` so it runs without `sudo`
-6. Install a systemd service unit
+2. Prompt for or parse the network interface and victim IPs/subnet
+3. Install Rust via `rustup` if not present
+4. Compile Stage 1 in release mode
+5. Install the binary to `/usr/local/bin/ddos_stage1`
+6. Grant `CAP_NET_RAW` so it runs without `sudo`
+7. Install and configure systemd service units (`ddos-stage1` and `ddos-stage2`)
 
 ### Windows (Development / Testing Only)
 
@@ -326,16 +338,18 @@ If you prefer to run the components separately:
 
 #### 1. Stage 1 Rust Pre-Filter
 ```bash
-# Production (on sensor VM)
-sudo ddos_stage1 --interface ens19 --victim-ip 10.0.0.3
+# Production (on sensor VM, specifying multiple IPs or subnet)
+sudo ddos_stage1 --interface ens19 --victim-ips 10.0.0.3,10.0.0.4
+sudo ddos_stage1 --interface ens19 --victim-subnet 10.0.0.0/24
 ```
 # All options
-ddos_stage1 --interface <IFACE>     # required
-            --victim-ip <IP>        # BPF filter target
-            --k <FLOAT>             # anomaly multiplier (default: 2.0)
-            --alpha <FLOAT>         # EWMA smoothing (default: 0.125)
-            --socket <PATH>         # IPC socket path (default: /tmp/ddos_stage1.sock)
-            --no-filter             # disable BPF (dev only)
+ddos_stage1 --interface <IFACE>       # required
+            --victim-ips <IPs>        # BPF filter IP list (comma-separated, alias: --victim-ip)
+            --victim-subnet <SUBNET>  # BPF filter subnet (e.g. 10.0.0.0/24)
+            --k <FLOAT>               # anomaly multiplier (default: 2.0)
+            --alpha <FLOAT>           # EWMA smoothing (default: 0.125)
+            --socket <PATH>           # IPC socket path (default: /tmp/ddos_stage1.sock)
+            --no-filter               # disable BPF (dev only)
 ```
 
 ### Log Levels
@@ -354,10 +368,10 @@ RUST_LOG=warn   # anomalies and errors only
 [INFO] BPF filter target victim IP = 10.0.0.3
 [INFO] Capture: capture loop started on 'br0'
 
-# Warmup (first 1,500 packets = 30 windows)
-[INFO] Analysis: warm-up window 1/30  | r=0.0 pps   | h=0.000 bits
-[INFO] Analysis: warm-up window 15/30 | r=842.3 pps  | h=4.821 bits
-[INFO] Analysis: warm-up window 30/30 | r=917.1 pps  | h=5.103 bits
+# Warmup (first 10,000 packets = 200 windows)
+[INFO] Analysis: warm-up window 1/200   | r=0.0 pps   | h=0.000 bits
+[INFO] Analysis: warm-up window 100/200 | r=842.3 pps  | h=4.821 bits
+[INFO] Analysis: warm-up window 200/200 | r=917.1 pps  | h=5.103 bits
 
 # Normal operation — silence at INFO level (no news = good news)
 # With RUST_LOG=debug:
@@ -377,6 +391,47 @@ RUST_LOG=warn   # anomalies and errors only
 | `0x01` | Rate only | Volumetric flood, diverse sources — possible flash crowd |
 | `0x02` | Entropy only | Concentrated source, low volume |
 | `0x03` | Both | High volume + single dominant source — highest confidence DDoS |
+
+---
+
+## Model Training and Data Capture
+
+To train the Random Forest model in Stage 2, you need to capture traffic using the live-label switching feature of Stage 1 to ensure a continuous, un-poisoned baseline.
+
+### 1. Generating Training Data
+
+Start the sensor, logging to a CSV:
+```bash
+sudo ddos_stage1 --label 0 --train-csv ../stage2/training_data.csv
+```
+
+**Capture Sequence (The "Clean Rule" for Labels):**
+To avoid poisoning the label with transitioning traffic, always wait for traffic to hit its target rate before applying the attack label, and reset the label to `0` before turning off the attack.
+
+1. **Phase 0 (Peacetime):** Let it run on normal traffic for ~4 minutes for Welford warm-up (wait for the `warm-up complete` log), then let it capture ~5 minutes of steady normal traffic.
+2. **Phase 1 (Flash Crowd):**
+   - Start your 100-IP `curl` flash crowd. Wait ~10 seconds for it to hit full rate.
+   - Run: `echo 1 > /tmp/ddos_label`. Run for ~5 minutes.
+   - Run: `echo 0 > /tmp/ddos_label`. Stop `curl`. Wait for traffic to return to baseline.
+3. **Phase 2a (Single-Source DDoS):**
+   - Start single-source `hping3` at ~3,000 pps. Wait ~10 seconds.
+   - Run: `echo 2 > /tmp/ddos_label`. Run for ~3 minutes.
+   - Run: `echo 0 > /tmp/ddos_label`. Stop `hping3`. Wait for traffic to return to baseline.
+4. **Phase 2b (Distributed DDoS):**
+   - Start 50-source `hping3` distributed attack loop. Wait ~10 seconds.
+   - Run: `echo 2 > /tmp/ddos_label`. Run for ~3 minutes.
+   - Run: `echo 0 > /tmp/ddos_label`. Stop `hping3`.
+
+### 2. Training the Model
+
+Once you have your `training_data.csv` collected in the `stage2/` directory, run the training script:
+
+```bash
+cd stage2
+python3 train.py
+```
+
+This script will parse the CSV, apply preprocessing rules, compute delta features (`delta_rate`, `delta_entropy`), perform Random Forest training, validate session splitting, and save the trained model as `ddos_rf_model.joblib`.
 
 ---
 
@@ -416,18 +471,25 @@ sudo bash scripts/uninstall.sh --remove-build --remove-rust
 
 ## Stage 2 Integration (Python)
 
-Stage 2 listens on the Unix domain socket `/tmp/ddos_stage1.sock`, unpacks the incoming 88-byte `FeatureVector` structs, and classifies traffic in real-time. It operates as a FastAPI application with a persistent SQLite storage layer and a dynamic Chart.js dashboard.
+Stage 2 listens on the Unix domain socket `/tmp/ddos_stage1.sock`, unpacks the incoming 152-byte `FeatureVector` structs, and classifies traffic in real-time. It operates as a FastAPI application with a persistent SQLite storage layer and a dynamic Chart.js dashboard.
 
 
-The eight features fed to the Random Forest classifier:
+The features unpacked from the Feature Vector:
 1. Source IP Entropy (`entropy`)
 2. Packet Rate (`ewma_rate`)
 3. Entropy Running Mean (`mean_h`)
 4. Packet Rate Running Mean (`mean_r`)
 5. Entropy Standard Deviation (`sigma_h`)
 6. Packet Rate Standard Deviation (`sigma_r`)
-7. Protocol Ratio (`proto_ratio`)
+7. Protocol Ratio (`proto_ratio` - legacy)
 8. Dominant Source IP Ratio (`dominant_ip_ratio`)
+9. Timestamp (`timestamp`)
+10. TCP Ratio (`proto_tcp`)
+11. UDP Ratio (`proto_udp`)
+12. ICMP Ratio (`proto_icmp`)
+13. SCTP Ratio (`proto_sctp`)
+14. GRE Ratio (`proto_gre`)
+15. ESP Ratio (`proto_esp`)
 
 ### Core Safeguards and Adaptive Baselines
 

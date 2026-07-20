@@ -350,10 +350,10 @@
         const protoChart = new Chart(document.getElementById('protoChart').getContext('2d'), {
             type: 'doughnut',
             data: {
-                labels: ['TCP', 'UDP/ICMP/OTHER'],
+                labels: ['TCP', 'UDP', 'ICMP', 'SCTP', 'GRE', 'ESP', 'OTHER'],
                 datasets: [{
-                    data: [1, 0],
-                    backgroundColor: ['#00a2b0', '#002d33'],
+                    data: [1, 0, 0, 0, 0, 0, 0],
+                    backgroundColor: ['#00a2b0', '#0ea5e9', '#f59e0b', '#10b981', '#a855f7', '#ec4899', '#4b5563'],
                     borderColor: '#0a0e14',
                     borderWidth: 2
                 }]
@@ -595,7 +595,14 @@
                 }
 
                 // Protocol doughnut
-                protoChart.data.datasets[0].data = [data.proto_ratio, 1.0 - data.proto_ratio];
+                const p_tcp = data.proto_tcp !== undefined ? data.proto_tcp : data.proto_ratio;
+                const p_udp = data.proto_udp !== undefined ? data.proto_udp : (1.0 - data.proto_ratio);
+                const p_icmp = data.proto_icmp !== undefined ? data.proto_icmp : 0.0;
+                const p_sctp = data.proto_sctp !== undefined ? data.proto_sctp : 0.0;
+                const p_gre = data.proto_gre !== undefined ? data.proto_gre : 0.0;
+                const p_esp = data.proto_esp !== undefined ? data.proto_esp : 0.0;
+                const p_other = Math.max(0.0, 1.0 - (p_tcp + p_udp + p_icmp + p_sctp + p_gre + p_esp));
+                protoChart.data.datasets[0].data = [p_tcp, p_udp, p_icmp, p_sctp, p_gre, p_esp, p_other];
                 protoChart.update();
 
                 // Latest logs/mitigation
@@ -604,9 +611,10 @@
                     const logs = data.latest_logs.slice(0, 3);
                     logs.forEach(l => {
                         const style = l.classification === 'DDoS' ? 'color: var(--accent-alert);' : '';
+                        const targetStr = l.victim_ip ? ` targeting ${l.victim_ip}` : '';
                         html += `<div style="margin-bottom: 8px; ${style}">
                             [${new Date(l.timestamp*1000).toISOString().split('T')[1].substring(0,8)}] 
-                            ${l.classification.toUpperCase()} from ${l.src_ip} -> blocked
+                            ${l.classification.toUpperCase()} from ${l.src_ip}${targetStr} -> blocked
                         </div>`;
                     });
                     document.getElementById('latestMitigation').innerHTML = html;

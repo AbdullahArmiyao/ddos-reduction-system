@@ -17,12 +17,13 @@
 #   6. Writes a systemd service unit (Linux only) to allow boot-time autostart.
 #
 # Usage:
-#   sudo bash scripts/install.sh [--interface br0] [--victim-ip 10.0.0.3]
+#   sudo bash scripts/install.sh [--interface ens19] [--victim-ips 10.0.0.3,10.0.0.4] [--victim-subnet 10.0.0.0/24]
 #
 # Options:
-#   --interface  <IFACE>   Default capture interface written into the service unit
-#   --victim-ip  <IP>      Default victim IP written into the service unit
-#   --no-service           Skip systemd unit installation
+#   --interface  <IFACE>     Default capture interface written into the service unit
+#   --victim-ips <IPs>       Default list of victim IPs (comma-separated, alias: --victim-ip)
+#   --victim-subnet <SUBNET> Default victim subnet CIDR (e.g. 10.0.0.0/24)
+#   --no-service             Skip systemd unit installation
 #
 # Notes:
 #   • Must be run as root (or with sudo) because pcap and systemd require it.
@@ -44,6 +45,8 @@ error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 # ── Defaults ──────────────────────────────────────────────────────────────────
 INTERFACE="br0"
 VICTIM_IP=""
+VICTIM_IPS=""
+VICTIM_SUBNET=""
 INSTALL_SERVICE=true
 BINARY_NAME="ddos_stage1"
 INSTALL_DIR="/usr/local/bin"
@@ -54,9 +57,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")/stage1"
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --interface)  INTERFACE="$2"; shift 2 ;;
-        --victim-ip)  VICTIM_IP="$2"; shift 2 ;;
-        --no-service) INSTALL_SERVICE=false; shift ;;
+        --interface)               INTERFACE="$2"; shift 2 ;;
+        --victim-ip|--victim-ips)  VICTIM_IPS="$2"; shift 2 ;;
+        --victim-subnet)           VICTIM_SUBNET="$2"; shift 2 ;;
+        --no-service)              INSTALL_SERVICE=false; shift ;;
         --help|-h)
             grep '^#' "$0" | head -40 | sed 's/^# \?//'
             exit 0 ;;
@@ -74,6 +78,39 @@ info "════════════════════════�
 info "  Adaptive DDoS Mitigation — Stage 1 & 2 Installer     "
 info "═══════════════════════════════════════════════════════"
 echo ""
+
+# ── Interactive prompts ───────────────────────────────────────────────────────
+if [[ -t 0 ]]; then
+    # Resolve current target default for the prompt
+    CURRENT_TARGET=""
+    if [[ -n "$VICTIM_IPS" ]]; then
+        CURRENT_TARGET="$VICTIM_IPS"
+    elif [[ -n "$VICTIM_SUBNET" ]]; then
+        CURRENT_TARGET="$VICTIM_SUBNET"
+    fi
+
+    echo -ne "${YELLOW}[INPUT]${NC} Enter the network interface to monitor [default: ${INTERFACE}]: "
+    read -r input_iface
+    if [[ -n "$input_iface" ]]; then
+        INTERFACE="$input_iface"
+    fi
+
+    echo -ne "${YELLOW}[INPUT]${NC} Enter the victim IP(s) or subnet (e.g. 10.0.0.3 or 10.0.0.0/24) [default: ${CURRENT_TARGET:-none}]: "
+    read -r input_target
+    if [[ -n "$input_target" ]]; then
+        if [[ "$input_target" == "none" ]]; then
+            VICTIM_IPS=""
+            VICTIM_SUBNET=""
+        elif [[ "$input_target" == *"/"* ]]; then
+            VICTIM_SUBNET="$input_target"
+            VICTIM_IPS=""
+        else
+            VICTIM_IPS="$input_target"
+            VICTIM_SUBNET=""
+        fi
+    fi
+    echo ""
+fi
 
 # =============================================================================
 # STEP 1 — Detect OS and package manager
@@ -241,9 +278,9 @@ if [[ -d "$STAGE2_DIR" ]]; then
     fi
     info "Creating virtual environment at $STAGE2_DIR/venv..."
     if [[ "$PKG_MANAGER" == "apk" ]]; then
-        python3 -m venv --system-site-packages "$STAGE2_DIR/venv"
+        python3 -m venv --clear --system-site-packages "$STAGE2_DIR/venv"
     else
-        python3 -m venv "$STAGE2_DIR/venv"
+        python3 -m venv --clear "$STAGE2_DIR/venv"
     fi
     
     info "Installing dependencies from requirements.txt..."
@@ -266,10 +303,12 @@ if $INSTALL_SERVICE && command -v systemctl &>/dev/null; then
 
     # Build the ExecStart command line.
     EXEC_START="\"$INSTALL_DIR/$BINARY_NAME\" --interface $INTERFACE"
-    if [[ -n "$VICTIM_IP" ]]; then
-        EXEC_START+=" --victim-ip $VICTIM_IP"
+    if [[ -n "$VICTIM_IPS" ]]; then
+        EXEC_START+=" --victim-ips $VICTIM_IPS"
+    elif [[ -n "$VICTIM_SUBNET" ]]; then
+        EXEC_START+=" --victim-subnet $VICTIM_SUBNET"
     else
-        warn "No --victim-ip specified. Service will run without a BPF filter (dev mode)."
+        warn "No --victim-ips or --victim-subnet specified. Service will run without a BPF filter (dev mode)."
         EXEC_START+=" --no-filter"
     fi
 
@@ -355,14 +394,14 @@ info "before starting the detection services."
 info ""
 info "Step 1: Generate Training Data (Capture on your gateway interface):"
 info ""
-info "  a) Capture NORMAL peacetime baseline traffic (Label 0) for ~2 minutes:"
-info "     sudo ddos_stage1 --interface $INTERFACE --victim-ip <VICTIM_IP> --train-csv stage1/training_data.csv --train-label 0"
+info "  a) Capture NORMAL peacetime baseline traffic (Label 0) for ~5 minutes (until warm-up completes):"
+info "     sudo ddos_stage1 --interface \$INTERFACE --victim-ips <VICTIM_IPS> --train-csv stage1/training_data.csv --train-label 0"
 info ""
-info "  b) Capture FLASH CROWD (legitimate high-volume) traffic (Label 1) for ~2 minutes:"
-info "     sudo ddos_stage1 --interface $INTERFACE --victim-ip <VICTIM_IP> --train-csv stage1/training_data.csv --train-label 1"
+info "  b) Capture FLASH CROWD (legitimate high-volume) traffic (Label 1) for ~5 minutes (until warm-up completes):"
+info "     sudo ddos_stage1 --interface \$INTERFACE --victim-ips <VICTIM_IPS> --train-csv stage1/training_data.csv --train-label 1"
 info ""
-info "  c) Capture DDoS attack traffic (Label 2) for ~2 minutes:"
-info "     sudo ddos_stage1 --interface $INTERFACE --victim-ip <VICTIM_IP> --train-csv stage1/training_data.csv --train-label 2"
+info "  c) Capture DDoS attack traffic (Label 2) for ~5 minutes (until warm-up completes):"
+info "     sudo ddos_stage1 --interface \$INTERFACE --victim-ips <VICTIM_IPS> --train-csv stage1/training_data.csv --train-label 2"
 info ""
 info "Step 2: Train the Random Forest Classifier Model:"
 info "  Run the training script (this cleans transient rows, balances classes,"

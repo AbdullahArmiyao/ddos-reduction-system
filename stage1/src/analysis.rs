@@ -55,7 +55,7 @@
 
 use crate::{
     capture::{PacketMeta, Protocol},
-    entropy::{EntropyAccumulator, WINDOW_SIZE},
+    entropy::{EntropyAccumulator, MIN_PACKETS_FOR_ENTROPY},
     ewma::EwmaState,
     ipc::{FeatureVector, IpcSocket, FLAG_ENTROPY_ANOMALY, FLAG_RATE_ANOMALY},
     welford::WelfordAccumulator,
@@ -124,6 +124,9 @@ pub struct TargetState {
     tcp_count: u32,
     udp_count: u32,
     icmp_count: u32,
+    sctp_count: u32,
+    gre_count: u32,
+    esp_count: u32,
     welford_rate: WelfordAccumulator,
     welford_entropy: WelfordAccumulator,
     peacetime_rate_ref: Option<f64>,
@@ -134,6 +137,7 @@ pub struct TargetState {
     last_window_close: Instant,
     cooldown_counter: usize,
     last_sent_time: f64,
+    warmup_completed_logged: bool,
 }
 
 impl TargetState {
@@ -144,6 +148,9 @@ impl TargetState {
             tcp_count: 0,
             udp_count: 0,
             icmp_count: 0,
+            sctp_count: 0,
+            gre_count: 0,
+            esp_count: 0,
             welford_rate: WelfordAccumulator::default(),
             welford_entropy: WelfordAccumulator::default(),
             peacetime_rate_ref: None,
@@ -154,6 +161,7 @@ impl TargetState {
             last_window_close: Instant::now(),
             cooldown_counter: 0,
             last_sent_time: 0.0,
+            warmup_completed_logged: false,
         }
     }
 }
@@ -210,6 +218,10 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
     let mut flow_counts: HashMap<(IpAddr, u16, u8), u32> = HashMap::new();
     let mut last_flow_write = Instant::now();
 
+    // Live label state for training
+    let mut current_train_label = cfg.train_label;
+    let mut last_label_check = Instant::now();
+
     // -------------------------------------------------------------------------
     // Main loop — one iteration per packet received from the capture thread.
     // -------------------------------------------------------------------------
@@ -219,6 +231,9 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             Protocol::Tcp => 6,
             Protocol::Udp => 17,
             Protocol::Icmp => 1,
+            Protocol::Sctp => 132,
+            Protocol::Gre => 47,
+            Protocol::Esp => 50,
             Protocol::Other => 0,
         };
         *flow_counts.entry((meta.src_ip, meta.dst_port, proto_num)).or_insert(0) += 1;
@@ -256,27 +271,39 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             Protocol::Tcp  => target_state.tcp_count  += 1,
             Protocol::Udp  => target_state.udp_count  += 1,
             Protocol::Icmp => target_state.icmp_count += 1,
-            Protocol::Other => {} // not tracked in the ratio
+            Protocol::Sctp => target_state.sctp_count += 1,
+            Protocol::Gre  => target_state.gre_count  += 1,
+            Protocol::Esp  => target_state.esp_count  += 1,
+            Protocol::Other => {}
         }
 
         // =====================================================================
-        // LAYER 2 — Window Close (every WINDOW_SIZE packets)
+        // LAYER 2 — Hybrid Window Close
         // =====================================================================
-        if !target_state.entropy.is_window_full() {
-            // Window not yet closed — continue to next packet.
+        // Close condition (OR-boundary):
+        //   Condition A: ≥0.5s elapsed AND ≥20 packets accumulated
+        //   Condition B: OR ≥1.0s elapsed (hard cap — ensures telemetry even in lulls)
+        //
+        // This prevents the Session-3 artifact (700 windows/sec under floods)
+        // while guaranteeing ≥1 row/sec during low-traffic transitions.
+        let now_instant = Instant::now();
+        let window_elapsed = now_instant.duration_since(target_state.last_window_close).as_secs_f64();
+        let packet_count = target_state.entropy.packet_count();
+
+        let should_close = (window_elapsed >= 0.5 && packet_count >= MIN_PACKETS_FOR_ENTROPY)
+                        || (window_elapsed >= 1.0);
+
+        if !should_close {
             continue;
         }
 
         target_state.window_id += 1;
-
-        // Calculate window duration and update the EWMA rate once per window.
-        // This eliminates timing jitter spikes from microsecond packet spacing.
-        let now_instant = Instant::now();
-        let window_duration = now_instant.duration_since(target_state.last_window_close).as_secs_f64();
         target_state.last_window_close = now_instant;
 
-        let window_rate = if window_duration > 0.0 {
-            WINDOW_SIZE as f64 / window_duration
+        // Rate = actual accumulated packets / measured wall-clock elapsed time.
+        // NOT a hardcoded WINDOW_SIZE — uses the real packet count and real duration.
+        let window_rate = if window_elapsed > 0.0 {
+            packet_count as f64 / window_elapsed
         } else {
             0.0
         };
@@ -297,7 +324,8 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         };
         target_state.ewma.update_rate_with_alpha(window_rate, active_alpha);
 
-        // Compute Shannon Entropy scalar h from the current window's IP distribution.
+        // Compute Normalized Shannon Entropy scalar h from the current window's
+        // IP distribution.  Returns [0.0, 1.0] — decoupled from window size.
         // This call clears the internal HashMap and resets the packet counter.
         let h = target_state.entropy.compute_and_reset();
 
@@ -305,12 +333,16 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         // The EWMA itself is NOT reset — it retains cross-window memory.
         let r = target_state.ewma.snapshot();
 
-        // Compute the dominant-IP ratio: fraction of packets from the busiest IP, and retrieve that IP.
+        // Compute the dominant-IP ratio: fraction of packets from the busiest IP.
         let (dominant_ip, dominant_count) = target_state.ip_counts.iter()
             .map(|(ip, count)| (*ip, *count))
             .max_by_key(|(_, count)| *count)
             .unwrap_or((std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0));
-        let dominant_ip_ratio = dominant_count as f64 / target_state.window_packet_count as f64;
+        let dominant_ip_ratio = if packet_count > 0 {
+            dominant_count as f64 / packet_count as f64
+        } else {
+            0.0
+        };
 
         // Compute proto_ratio: fraction of window packets that were TCP.
         // Range [0.0, 1.0] — a UDP/ICMP flood will push this toward 0.0.
@@ -320,6 +352,14 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         } else {
             0.0
         };
+
+        let total_packets = target_state.window_packet_count.max(1) as f64;
+        let proto_tcp = target_state.tcp_count as f64 / total_packets;
+        let proto_udp = target_state.udp_count as f64 / total_packets;
+        let proto_icmp = target_state.icmp_count as f64 / total_packets;
+        let proto_sctp = target_state.sctp_count as f64 / total_packets;
+        let proto_gre = target_state.gre_count as f64 / total_packets;
+        let proto_esp = target_state.esp_count as f64 / total_packets;
 
         // Wall-clock timestamp of this window close (seconds since UNIX epoch).
         // Used by Stage 2 for time-based analysis and logging.
@@ -335,12 +375,28 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             last_flow_write = now_instant;
         }
 
+        // Live label check (every 1s)
+        if now_instant.duration_since(last_label_check).as_secs_f64() >= 1.0 {
+            if let Ok(content) = std::fs::read_to_string("/tmp/ddos_label") {
+                if let Ok(parsed) = content.trim().parse::<u8>() {
+                    if parsed != current_train_label {
+                        info!("Analysis: Live label switch triggered via /tmp/ddos_label. Changed from {} to {}", current_train_label, parsed);
+                        current_train_label = parsed;
+                    }
+                }
+            }
+            last_label_check = now_instant;
+        }
+
         // Reset all per-window accumulators for the next window.
         target_state.ip_counts.clear();
         target_state.window_packet_count = 0;
         target_state.tcp_count  = 0;
         target_state.udp_count  = 0;
         target_state.icmp_count = 0;
+        target_state.sctp_count = 0;
+        target_state.gre_count  = 0;
+        target_state.esp_count  = 0;
 
         // =====================================================================
         // LAYER 3 — Anomaly Evaluation and Welford Update
@@ -369,6 +425,12 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 proto_ratio,
                 dominant_ip_ratio,
                 timestamp,
+                proto_tcp,
+                proto_udp,
+                proto_icmp,
+                proto_sctp,
+                proto_gre,
+                proto_esp,
                 dominant_ip: IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), // No dominant IP during warmup
                 victim_ip:   meta.dst_ip,
             };
@@ -377,6 +439,14 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
             }
 
             continue;
+        }
+
+        if !target_state.warmup_completed_logged {
+            info!("Analysis [victim={}]: warm-up complete! Active monitoring started.", meta.dst_ip);
+            if cfg.train_csv.is_some() {
+                info!("Analysis [victim={}]: training mode active — now appending rows to CSV file.", meta.dst_ip);
+            }
+            target_state.warmup_completed_logged = true;
         }
 
         // Get raw standard deviations
@@ -389,8 +459,10 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         let ceiling_r = (0.2 * target_state.welford_rate.mean).max(10000.0);
         let sigma_r = raw_sigma_r.max(50.0).min(ceiling_r);
 
-        // Cap entropy standard deviation at 0.5 bits, floor at 0.05 bits.
-        let sigma_h = raw_sigma_h.max(0.05).min(0.5);
+        // Cap entropy standard deviation at 0.15 (normalized scale), floor at 0.02.
+        // (Entropy is now normalized [0, 1], so these are proportionally smaller
+        // than the raw-entropy-era values of 0.5 ceiling / 0.05 floor.)
+        let sigma_h = raw_sigma_h.max(0.02).min(0.15);
 
         // 2. High-Sensitivity Cooldown Mode & Entropy-Guided Scaling:
         // - If we are within the cooldown recovery window, reduce the baseline multiplier to increase sensitivity.
@@ -410,7 +482,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         let rate_k = if r > (target_state.welford_rate.mean + 10.0 * sigma_r) {
             base_k
         } else {
-            let divisor = if mean_h > 0.0 { mean_h } else { 4.0 };
+            let divisor = if mean_h > 0.0 { mean_h } else { 0.8 };
             base_k * (h / divisor).max(1.0)
         };
         let entropy_k = base_k;
@@ -434,7 +506,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
         let real_rate_k = if r > (target_state.welford_rate.mean + 10.0 * sigma_r) {
             cfg.k
         } else {
-            let divisor = if mean_h > 0.0 { mean_h } else { 4.0 };
+            let divisor = if mean_h > 0.0 { mean_h } else { 0.8 };
             cfg.k * (h / divisor).max(1.0)
         };
         let real_rate_boundary = target_state.welford_rate.mean + real_rate_k * sigma_r;
@@ -516,6 +588,12 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 proto_ratio,
                 dominant_ip_ratio,
                 timestamp,
+                proto_tcp,
+                proto_udp,
+                proto_icmp,
+                proto_sctp,
+                proto_gre,
+                proto_esp,
                 dominant_ip,
                 victim_ip:   meta.dst_ip,
             };
@@ -542,7 +620,7 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 sigma_h, sigma_r,
                 proto_ratio, dominant_ip_ratio,
                 timestamp,
-                cfg.train_label
+                current_train_label
             );
         }
     }
