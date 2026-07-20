@@ -75,18 +75,81 @@ use std::{env, process};
 // This parser handles `--flag value` style arguments only.
 
 /// Parse CLI arguments from `std::env::args()` into a plain struct.
+#[derive(Debug, Clone)]
+pub enum VictimTargets {
+    List(Vec<std::net::IpAddr>),
+    Subnet {
+        ip: std::net::IpAddr,
+        prefix: u8,
+    },
+}
+
+impl VictimTargets {
+    pub fn contains(&self, target: &std::net::IpAddr) -> bool {
+        match self {
+            VictimTargets::List(list) => list.contains(target),
+            VictimTargets::Subnet { ip, prefix } => {
+                match (ip, target) {
+                    (std::net::IpAddr::V4(net_v4), std::net::IpAddr::V4(tgt_v4)) => {
+                        let net_octets = net_v4.octets();
+                        let tgt_octets = tgt_v4.octets();
+                        let bits = *prefix as usize;
+                        if bits > 32 { return false; }
+                        let bytes = bits / 8;
+                        let extra_bits = bits % 8;
+                        for i in 0..bytes {
+                            if net_octets[i] != tgt_octets[i] {
+                                return false;
+                            }
+                        }
+                        if extra_bits > 0 {
+                            let mask = 0xFF_u8 << (8 - extra_bits);
+                            if (net_octets[bytes] & mask) != (tgt_octets[bytes] & mask) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    (std::net::IpAddr::V6(net_v6), std::net::IpAddr::V6(tgt_v6)) => {
+                        let net_octets = net_v6.octets();
+                        let tgt_octets = tgt_v6.octets();
+                        let bits = *prefix as usize;
+                        if bits > 128 { return false; }
+                        let bytes = bits / 8;
+                        let extra_bits = bits % 8;
+                        for i in 0..bytes {
+                            if net_octets[i] != tgt_octets[i] {
+                                return false;
+                            }
+                        }
+                        if extra_bits > 0 {
+                            let mask = 0xFF_u8 << (8 - extra_bits);
+                            if (net_octets[bytes] & mask) != (tgt_octets[bytes] & mask) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+}
+
+/// Parse CLI arguments from `std::env::args()` into a plain struct.
 struct CliArgs {
-    interface: String,
-    victim_ip: Option<String>,
-    k:         f64,
-    alpha:     f64,
-    socket:    String,
-    no_filter: bool,
-    log_file:  Option<String>,
+    interface:      String,
+    victim_targets: Option<VictimTargets>,
+    k:              f64,
+    alpha:          f64,
+    socket:         String,
+    no_filter:      bool,
+    log_file:       Option<String>,
     /// If set, write every post-warmup feature vector to this CSV file.
-    train_csv: Option<String>,
+    train_csv:      Option<String>,
     /// Integer class label written into the CSV (0=normal, 1=flash_crowd, 2=ddos).
-    train_label: u8,
+    train_label:    u8,
 }
 
 impl CliArgs {
@@ -94,7 +157,8 @@ impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = env::args().collect();
         let mut interface = String::new();
-        let mut victim_ip: Option<String> = None;
+        let mut victim_ips: Option<String> = None;
+        let mut victim_subnet: Option<String> = None;
         let mut k         = 2.0_f64;
         let mut alpha     = ewma::DEFAULT_ALPHA;
         let mut socket      = ipc::SOCKET_PATH.to_string();
@@ -110,9 +174,13 @@ impl CliArgs {
                     i += 1;
                     interface = args.get(i).cloned().unwrap_or_default();
                 }
-                "--victim-ip" => {
+                "--victim-ip" | "--victim-ips" => {
                     i += 1;
-                    victim_ip = args.get(i).cloned();
+                    victim_ips = args.get(i).cloned();
+                }
+                "--victim-subnet" => {
+                    i += 1;
+                    victim_subnet = args.get(i).cloned();
                 }
                 "--k" => {
                     i += 1;
@@ -167,17 +235,55 @@ impl CliArgs {
             process::exit(1);
         }
 
-        Self { interface, victim_ip, k, alpha, socket, no_filter, log_file, train_csv, train_label }
+        // Build VictimTargets enum
+        let victim_targets = if let Some(ref ip_str) = victim_ips {
+            let mut list = Vec::new();
+            for s in ip_str.split(',') {
+                if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                    list.push(ip);
+                } else {
+                    eprintln!("Error: Invalid IP address '{s}' in victim list.");
+                    process::exit(1);
+                }
+            }
+            Some(VictimTargets::List(list))
+        } else if let Some(ref subnet_str) = victim_subnet {
+            let parts: Vec<&str> = subnet_str.split('/').collect();
+            if parts.len() != 2 {
+                eprintln!("Error: Invalid subnet format '{subnet_str}'. Must be IP/prefix (e.g. 10.0.0.0/24).");
+                process::exit(1);
+            }
+            let ip = match parts[0].parse::<std::net::IpAddr>() {
+                Ok(addr) => addr,
+                Err(_) => {
+                    eprintln!("Error: Invalid subnet IP address '{}'.", parts[0]);
+                    process::exit(1);
+                }
+            };
+            let prefix = match parts[1].parse::<u8>() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("Error: Invalid subnet prefix '{}'.", parts[1]);
+                    process::exit(1);
+                }
+            };
+            Some(VictimTargets::Subnet { ip, prefix })
+        } else {
+            None
+        };
+
+        Self { interface, victim_targets, k, alpha, socket, no_filter, log_file, train_csv, train_label }
     }
 }
 
 fn print_usage(bin: &str) {
     eprintln!(
-        r"\nUsage: {bin} --interface <IFACE> [--victim-ip <IP>] [OPTIONS]\n"
+        r"\nUsage: {bin} --interface <IFACE> [--victim-ips <IP1,IP2,...> | --victim-subnet <SUBNET>] [OPTIONS]\n"
     );
     eprintln!("Options:");
     eprintln!("  --interface  <IFACE>   Network interface to sniff (e.g., br0)");
-    eprintln!("  --victim-ip  <IP>      BPF filter IP. Omit with --no-filter.");
+    eprintln!("  --victim-ips <IPs>     BPF filter IP list, comma-separated (alias: --victim-ip)");
+    eprintln!("  --victim-subnet <NET>  BPF filter subnet range (e.g. 10.0.0.0/24)");
     eprintln!("  --k          <FLOAT>   Anomaly multiplier k  [default: 2.0]");
     eprintln!("  --alpha      <FLOAT>   EWMA smoothing alpha  [default: 0.125]");
     eprintln!("  --socket     <PATH>    IPC socket path       [default: /tmp/ddos_stage1.sock]");
@@ -298,23 +404,23 @@ fn main() {
     // -------------------------------------------------------------------------
 
     // Capture config: BPF filter applied only when --no-filter is not set
-    // and a victim IP was provided.
-    let cap_cfg = if args.no_filter || args.victim_ip.is_none() {
+    // and victim targets were provided.
+    let cap_cfg = if args.no_filter || args.victim_targets.is_none() {
         log::warn!("main: BPF filter DISABLED — all traffic will be processed (dev mode only)");
         CaptureConfig::for_test(&args.interface)
     } else {
-        let victim = args.victim_ip.as_deref().unwrap();
-        info!("main: BPF filter target victim IP = {victim}");
-        CaptureConfig::for_bridge(&args.interface, victim)
+        let targets = args.victim_targets.as_ref().unwrap();
+        info!("main: BPF filter enabled for targets: {:?}", targets);
+        CaptureConfig::for_targets(&args.interface, targets)
     };
 
     let analysis_cfg = AnalysisConfig {
-        k:           args.k,
-        ewma_alpha:  args.alpha,
-        socket_path: args.socket.clone(),
-        victim_ip:   args.victim_ip.clone().unwrap_or_default(),
-        train_csv:   args.train_csv.clone(),
-        train_label: args.train_label,
+        k:              args.k,
+        ewma_alpha:     args.alpha,
+        socket_path:    args.socket.clone(),
+        victim_targets: args.victim_targets.clone(),
+        train_csv:      args.train_csv.clone(),
+        train_label:    args.train_label,
     };
 
     // -------------------------------------------------------------------------

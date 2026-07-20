@@ -18,6 +18,49 @@
             color: var(--accent-cyan);
             margin-left: 8px;
         }
+        .tabs-bar {
+            user-select: none;
+        }
+        .tab-button:hover {
+            color: var(--text-bright) !important;
+        }
+        .tab-button.active {
+            border-bottom: 2px solid var(--accent-cyan) !important;
+            color: var(--accent-cyan) !important;
+        }
+        .data-table tbody tr {
+            border-bottom: 1px solid rgba(0, 162, 176, 0.15);
+            transition: background-color 0.2s;
+        }
+        .data-table tbody tr:hover {
+            background-color: rgba(0, 240, 255, 0.02);
+        }
+        .data-table td {
+            padding: 12px 15px;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            border-radius: 2px;
+            text-align: center;
+        }
+        .badge-normal {
+            background-color: rgba(0, 240, 255, 0.1);
+            color: var(--accent-cyan);
+            border: 1px solid var(--border-cyan);
+        }
+        .badge-flash {
+            background-color: rgba(255, 159, 10, 0.1);
+            color: #ff9f0a;
+            border: 1px solid rgba(255, 159, 10, 0.4);
+        }
+        .badge-ddos {
+            background-color: rgba(255, 59, 48, 0.1);
+            color: var(--accent-alert);
+            border: 1px solid var(--border-alert);
+        }
     </style>
 </head>
 <body>
@@ -58,74 +101,150 @@
         </div>
 
         <div class="content-area">
-            <!-- Stat Cards Grid -->
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <span class="stat-label">PACKET RATE (PPS)</span>
-                    <span id="statPps" class="stat-value">0.0</span>
-                    <span id="statPpsBaseline" class="stat-meta">BASELINE: 0.0</span>
+            <!-- Tab Controls -->
+            <div class="tabs-bar" style="display: flex; gap: 15px; border-bottom: 1px solid var(--border-cyan); margin-bottom: 20px;">
+                <div id="tabBtnGlobal" class="tab-button active" onclick="switchTab('global')" style="padding: 10px 20px; cursor: pointer; color: var(--accent-cyan); border-bottom: 2px solid var(--accent-cyan); font-weight: bold; letter-spacing: 1px; transition: all 0.2s;">GLOBAL OVERVIEW</div>
+                <div id="tabBtnTarget" class="tab-button" onclick="switchTab('target')" style="padding: 10px 20px; cursor: pointer; color: var(--text-dim); border-bottom: 2px solid transparent; font-weight: bold; letter-spacing: 1px; transition: all 0.2s;">TARGET MONITOR</div>
+            </div>
+
+            <!-- VIEW 1: GLOBAL OVERVIEW -->
+            <div id="viewGlobal">
+                <!-- Global Summary Cards -->
+                <div class="stats-grid" style="margin-bottom: 25px;">
+                    <div class="stat-card">
+                        <span class="stat-label">TOTAL ACCUMULATED RATE (PPS)</span>
+                        <span id="globalStatPps" class="stat-value">0.0</span>
+                        <span class="stat-meta">SUM OF ALL VICTIMS</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">MONITORED TARGETS</span>
+                        <span id="globalStatTargets" class="stat-value">0</span>
+                        <span class="stat-meta">ACTIVE DESTINATIONS</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">ATTACKED DESTINATIONS</span>
+                        <span id="globalStatAttacked" class="stat-value">0</span>
+                        <span class="stat-meta">STATUS: DDoS ACTIVE</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">BLOCKED HOSTS</span>
+                        <span id="globalStatBlocked" class="stat-value">0</span>
+                        <span class="stat-meta">GLOBAL FIREWALL SETS</span>
+                    </div>
                 </div>
-                <div class="stat-card">
-                    <span class="stat-label">SHANNON ENTROPY</span>
-                    <span id="statEntropy" class="stat-value">0.0000</span>
-                    <span id="statEntropyBaseline" class="stat-meta">BASELINE: 0.0000</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-label">WELFORD THRESHOLDS</span>
-                    <span id="statK" class="stat-value">k = 2.0</span>
-                    <span id="statSensitivity" class="stat-meta">MODE: STEADY COOLDOWN</span>
-                </div>
-                <div class="stat-card">
-                    <span class="stat-label">BLOCKED HOSTS</span>
-                    <span id="statBlocked" class="stat-value">0</span>
-                    <span class="stat-meta">IN KERNEL NETSET</span>
+
+                <!-- Global Target IP Matrix Table -->
+                <div class="hud-panel" style="margin-bottom: 25px;">
+                    <div class="hud-panel-header">
+                        <div class="hud-panel-title">MONITORED DESTINATION IPs // ACTIVE TELEMETRY MATRIX</div>
+                        <span class="metric-badge">REAL-TIME MULTI-IP INSPECTOR</span>
+                    </div>
+                    <div style="overflow-x: auto; padding: 15px;">
+                        <table class="data-table" style="width: 100%; border-collapse: collapse; font-family: inherit; font-size: 0.85rem; text-align: left;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid var(--border-cyan); color: var(--accent-cyan);">
+                                    <th style="padding: 10px 15px;">TARGET IP</th>
+                                    <th style="padding: 10px 15px;">RATE (PPS)</th>
+                                    <th style="padding: 10px 15px;">SHANNON ENTROPY</th>
+                                    <th style="padding: 10px 15px;">DOMINANT SENDER ratio</th>
+                                    <th style="padding: 10px 15px;">THREAT STATUS</th>
+                                    <th style="padding: 10px 15px;">ACTION</th>
+                                </tr>
+                            </thead>
+                            <tbody id="globalTargetsTableBody">
+                                <tr>
+                                    <td colspan="6" style="padding: 20px; text-align: center; color: var(--text-dim);">NO TARGET TELEMETRY CHANNELS ACTIVE</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 
-            <!-- Main Charts Row -->
-            <div class="hud-grid">
-                <div>
-                    <!-- Rate Chart -->
-                    <div class="hud-panel">
-                        <div class="hud-panel-header">
-                            <div class="hud-panel-title">PACKET DELIVERY VELOCITY // TIME SERIES</div>
-                            <span class="metric-badge">UNIT: PPS (10s RESOLUTION)</span>
-                        </div>
-                        <div class="chart-container">
-                            <canvas id="rateChart"></canvas>
-                        </div>
+            <!-- VIEW 2: TARGET MONITOR -->
+            <div id="viewTarget" style="display: none;">
+                <!-- Target Selector Panel -->
+                <div class="hud-panel" style="margin-bottom: 25px; padding: 15px; display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 15px;">
+                        <label for="victimSelect" style="color: var(--accent-cyan); font-weight: bold; font-size: 0.9rem;">MONITORING TARGET IP:</label>
+                        <select id="victimSelect" onchange="changeVictimTarget()" style="background-color: var(--bg-surface); color: var(--accent-cyan); border: 1px solid var(--border-cyan); padding: 6px 12px; font-family: inherit; font-size: 0.9rem; outline: none; cursor: pointer; border-radius: 2px;">
+                            <option value="">-- SELECT TARGET --</option>
+                        </select>
                     </div>
-
-                    <!-- Entropy Chart -->
-                    <div class="hud-panel">
-                        <div class="hud-panel-header">
-                            <div class="hud-panel-title">FLOW DISTRIBUTION ENTROPY // TIME SERIES</div>
-                            <span class="metric-badge">UNIT: SHANNON H (BITS)</span>
-                        </div>
-                        <div class="chart-container">
-                            <canvas id="entropyChart"></canvas>
-                        </div>
+                    <div style="color: var(--text-dim); font-size: 0.8rem; font-family: inherit;">
+                        ACTIVE INGRESS INTERFACE: <span id="targetInterfaceName" style="color: var(--text-bright); font-weight: bold;">--</span>
                     </div>
                 </div>
 
-                <!-- Right Side Donuts & Quick Panels -->
-                <div>
-                    <div class="hud-panel">
-                        <div class="hud-panel-header">
-                            <div class="hud-panel-title">PROTOCOL RATIO</div>
+                <!-- Stat Cards Grid -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <span class="stat-label">PACKET RATE (PPS)</span>
+                        <span id="statPps" class="stat-value">0.0</span>
+                        <span id="statPpsBaseline" class="stat-meta">BASELINE: 0.0</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">SHANNON ENTROPY</span>
+                        <span id="statEntropy" class="stat-value">0.0000</span>
+                        <span id="statEntropyBaseline" class="stat-meta">BASELINE: 0.0000</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">WELFORD THRESHOLDS</span>
+                        <span id="statK" class="stat-value">k = 2.0</span>
+                        <span id="statSensitivity" class="stat-meta">MODE: STEADY COOLDOWN</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="stat-label">BLOCKED HOSTS</span>
+                        <span id="statBlocked" class="stat-value">0</span>
+                        <span class="stat-meta">IN KERNEL NETSET</span>
+                    </div>
+                </div>
+
+                <!-- Main Charts Row -->
+                <div class="hud-grid">
+                    <div>
+                        <!-- Rate Chart -->
+                        <div class="hud-panel">
+                            <div class="hud-panel-header">
+                                <div class="hud-panel-title">PACKET DELIVERY VELOCITY // TIME SERIES</div>
+                                <span class="metric-badge">UNIT: PPS (10s RESOLUTION)</span>
+                            </div>
+                            <div class="chart-container">
+                                <canvas id="rateChart"></canvas>
+                            </div>
                         </div>
-                        <div style="height: 200px; position: relative;">
-                            <canvas id="protoChart"></canvas>
+
+                        <!-- Entropy Chart -->
+                        <div class="hud-panel">
+                            <div class="hud-panel-header">
+                                <div class="hud-panel-title">FLOW DISTRIBUTION ENTROPY // TIME SERIES</div>
+                                <span class="metric-badge">UNIT: SHANNON H (BITS)</span>
+                            </div>
+                            <div class="chart-container">
+                                <canvas id="entropyChart"></canvas>
+                            </div>
                         </div>
                     </div>
 
-                    <div class="hud-panel">
-                        <div class="hud-panel-header">
-                            <div class="hud-panel-title">LATEST MITIGATION ACTION</div>
+                    <!-- Right Side Donuts & Quick Panels -->
+                    <div>
+                        <div class="hud-panel">
+                            <div class="hud-panel-header">
+                                <div class="hud-panel-title">PROTOCOL RATIO</div>
+                            </div>
+                            <div style="height: 200px; position: relative;">
+                                <canvas id="protoChart"></canvas>
+                            </div>
                         </div>
-                        <div id="latestMitigation" style="font-family: inherit; font-size: 0.8rem; line-height: 1.6;">
-                            NO MITIGATION ACTIONS LOGGED.<br>
-                            SYSTEM DEPLOYED IN STEADY STATE.
+
+                        <div class="hud-panel">
+                            <div class="hud-panel-header">
+                                <div class="hud-panel-title">LATEST MITIGATION ACTION</div>
+                            </div>
+                            <div id="latestMitigation" style="font-family: inherit; font-size: 0.8rem; line-height: 1.6;">
+                                NO MITIGATION ACTIONS LOGGED.<br>
+                                SYSTEM DEPLOYED IN STEADY STATE.
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -144,6 +263,9 @@
         const maxPoints = 30;
         const timeLabels = Array(maxPoints).fill('');
         
+        let currentTab = 'global';
+        let selectedVictimIp = '';
+
         // Rate Chart Setup
         const rateCtx = document.getElementById('rateChart').getContext('2d');
         const rateChart = new Chart(rateCtx, {
@@ -225,8 +347,7 @@
         });
 
         // Protocol Doughnut
-        const protoCtx = document.getElementById('protoChart').getContext('2d');
-        const protoChart = new Chart(protoCtx, {
+        const protoChart = new Chart(document.getElementById('protoChart').getContext('2d'), {
             type: 'doughnut',
             data: {
                 labels: ['TCP', 'UDP/ICMP/OTHER'],
@@ -259,22 +380,190 @@
             setTimeout(() => toast.remove(), 4000);
         }
 
+        function switchTab(tab) {
+            currentTab = tab;
+            const btnGlobal = document.getElementById('tabBtnGlobal');
+            const btnTarget = document.getElementById('tabBtnTarget');
+            const viewGlobal = document.getElementById('viewGlobal');
+            const viewTarget = document.getElementById('viewTarget');
+
+            if (tab === 'global') {
+                btnGlobal.classList.add('active');
+                btnTarget.classList.remove('active');
+                viewGlobal.style.display = 'block';
+                viewTarget.style.display = 'none';
+            } else {
+                btnTarget.classList.add('active');
+                btnGlobal.classList.remove('active');
+                viewGlobal.style.display = 'none';
+                viewTarget.style.display = 'block';
+
+                // If no victim is selected but we have options, select the first option
+                const selectElement = document.getElementById('victimSelect');
+                if (!selectedVictimIp && selectElement.options.length > 1) {
+                    selectedVictimIp = selectElement.options[1].value;
+                    selectElement.value = selectedVictimIp;
+                    reloadTargetHistory();
+                }
+            }
+            fetchState();
+        }
+
+        function switchToTargetIp(ip) {
+            selectedVictimIp = ip;
+            document.getElementById('victimSelect').value = ip;
+            reloadTargetHistory();
+            switchTab('target');
+        }
+
+        async function changeVictimTarget() {
+            selectedVictimIp = document.getElementById('victimSelect').value;
+            await reloadTargetHistory();
+            fetchState();
+        }
+
+        async function reloadTargetHistory() {
+            if (!selectedVictimIp) return;
+            try {
+                const res = await fetch(`/api/history?target=${encodeURIComponent(selectedVictimIp)}`);
+                if (res.status === 401) {
+                    window.location.href = '/static/login.html';
+                    return;
+                }
+                const history = await res.json();
+                
+                // Clear chart data
+                const rateData = rateChart.data.datasets[0].data;
+                const rateBound = rateChart.data.datasets[1].data;
+                const entropyData = entropyChart.data.datasets[0].data;
+                const entropyBound = entropyChart.data.datasets[1].data;
+                
+                rateData.fill(0);
+                rateBound.fill(0);
+                entropyData.fill(0);
+                entropyBound.fill(0);
+                
+                if (history && history.length > 0) {
+                    const startIdx = Math.max(0, maxPoints - history.length);
+                    history.forEach((h, idx) => {
+                        const targetIdx = startIdx + idx;
+                        if (targetIdx < maxPoints) {
+                            rateData[targetIdx] = h.ewma_rate;
+                            rateBound[targetIdx] = h.mean_r + (h.k_multiplier * h.sigma_r);
+                            
+                            entropyData[targetIdx] = h.entropy;
+                            entropyBound[targetIdx] = h.mean_h - (h.k_multiplier * h.sigma_h);
+                        }
+                    });
+                }
+                rateChart.update();
+                entropyChart.update();
+            } catch (err) {
+                console.error("Failed to load target history:", err);
+            }
+        }
+
         async function fetchState() {
             try {
-                const res = await fetch('/api/state');
+                let url = '/api/state';
+                if (currentTab === 'target' && selectedVictimIp) {
+                    url += `?target=${encodeURIComponent(selectedVictimIp)}`;
+                }
+                const res = await fetch(url);
                 if (res.status === 401) {
                     window.location.href = '/static/login.html';
                     return;
                 }
                 const data = await res.json();
+
+                // 1. Populate victim dropdown if options changed
+                const selectElement = document.getElementById('victimSelect');
+                const activeTargets = Object.keys(data.last_metrics_by_target || {});
+                const allTargetsSet = new Set(activeTargets);
+                if (data.victim_targets) {
+                    data.victim_targets.forEach(t => allTargetsSet.add(t.ip || t));
+                }
+                const allTargets = Array.from(allTargetsSet).sort();
+
+                let optionValues = Array.from(selectElement.options).map(o => o.value);
+                let differs = optionValues.length !== (allTargets.length + 1);
+                if (!differs) {
+                    for (let i = 0; i < allTargets.length; i++) {
+                        if (optionValues[i+1] !== allTargets[i]) {
+                            differs = true;
+                            break;
+                        }
+                    }
+                }
                 
-                // Update live text values
+                if (differs) {
+                    selectElement.innerHTML = '<option value="">-- SELECT TARGET --</option>' + 
+                        allTargets.map(ip => `<option value="${ip}">${ip}</option>`).join('');
+                    if (allTargets.includes(selectedVictimIp)) {
+                        selectElement.value = selectedVictimIp;
+                    }
+                }
+
+                // 2. Global View Updates
+                let totalRate = 0.0;
+                let monitoredTargetsCount = 0;
+                let attackedTargetsCount = 0;
+                
+                activeTargets.forEach(ip => {
+                    const metric = data.last_metrics_by_target[ip];
+                    totalRate += metric.ewma_rate;
+                    monitoredTargetsCount++;
+                    if (metric.latest_classification === 'DDoS') {
+                        attackedTargetsCount++;
+                    }
+                });
+
+                document.getElementById('globalStatPps').innerText = totalRate.toFixed(1);
+                document.getElementById('globalStatTargets').innerText = monitoredTargetsCount;
+                document.getElementById('globalStatAttacked').innerText = attackedTargetsCount;
+                document.getElementById('globalStatBlocked').innerText = data.blocked_count;
+
+                const attackedCard = document.getElementById('globalStatAttacked');
+                if (attackedTargetsCount > 0) {
+                    attackedCard.style.color = 'var(--accent-alert)';
+                } else {
+                    attackedCard.style.color = 'var(--text-bright)';
+                }
+
+                let tableHtml = '';
+                if (activeTargets.length === 0) {
+                    tableHtml = `<tr><td colspan="6" style="padding: 20px; text-align: center; color: var(--text-dim);">NO TARGET TELEMETRY CHANNELS ACTIVE</td></tr>`;
+                } else {
+                    activeTargets.forEach(ip => {
+                        const metric = data.last_metrics_by_target[ip];
+                        let statusBadgeClass = 'badge badge-normal';
+                        if (metric.latest_classification === 'DDoS') statusBadgeClass = 'badge badge-ddos';
+                        else if (metric.latest_classification === 'Flash Crowd') statusBadgeClass = 'badge badge-flash';
+                        
+                        tableHtml += `
+                            <tr>
+                                <td style="padding: 12px 15px; color: var(--accent-cyan); font-weight: bold; cursor: pointer;" onclick="switchToTargetIp('${ip}')">${ip}</td>
+                                <td style="padding: 12px 15px;">${metric.ewma_rate.toFixed(1)}</td>
+                                <td style="padding: 12px 15px;">${metric.entropy.toFixed(4)}</td>
+                                <td style="padding: 12px 15px;">${(metric.dominant_ip_ratio * 100).toFixed(1)}%</td>
+                                <td style="padding: 12px 15px;"><span class="${statusBadgeClass}">${metric.latest_classification.toUpperCase()}</span></td>
+                                <td style="padding: 12px 15px;">
+                                    <button class="btn" onclick="switchToTargetIp('${ip}')" style="background-color: var(--bg-cyan-dark); border: 1px solid var(--border-cyan); color: var(--accent-cyan); padding: 3px 8px; font-size: 0.75rem; font-family: inherit; cursor: pointer; border-radius: 2px;">INSPECT</button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                }
+                document.getElementById('globalTargetsTableBody').innerHTML = tableHtml;
+
+                // 3. Target View Updates
                 document.getElementById('statPps').innerText = data.ewma_rate.toFixed(1);
                 document.getElementById('statPpsBaseline').innerText = `BASELINE: ${data.mean_r.toFixed(1)}`;
                 document.getElementById('statEntropy').innerText = data.entropy.toFixed(4);
                 document.getElementById('statEntropyBaseline').innerText = `BASELINE: ${data.mean_h.toFixed(4)}`;
                 document.getElementById('statK').innerText = `k = ${data.k_multiplier.toFixed(1)}`;
                 document.getElementById('statBlocked').innerText = data.blocked_count;
+                document.getElementById('targetInterfaceName').innerText = data.active_interface || '--';
                 
                 if (data.cooldown > 0) {
                     document.getElementById('statSensitivity').innerText = `MODE: COOLDOWN (${data.cooldown}s)`;
@@ -284,7 +573,6 @@
                     document.getElementById('statSensitivity').style.color = 'var(--text-dim)';
                 }
 
-                // Update system threat indicators
                 const threatBadge = document.getElementById('threatStatus');
                 if (data.latest_classification === 'DDoS') {
                     threatBadge.className = 'badge badge-ddos';
@@ -297,13 +585,14 @@
                     threatBadge.innerText = 'NORMAL OPERATION';
                 }
 
-                // Update Connection Stats
                 document.getElementById('engineStatusDot').className = 'status-dot';
                 document.getElementById('engineStatusText').innerText = 'GATEWAY ONLINE';
 
-                // Shift Chart Data
-                updateChart(rateChart, data.ewma_rate, data.mean_r + (data.k_multiplier * data.sigma_r));
-                updateChart(entropyChart, data.entropy, data.mean_h - (data.k_multiplier * data.sigma_h));
+                // Shift Chart Data if victim is loaded
+                if (currentTab === 'target' && selectedVictimIp) {
+                    updateChart(rateChart, data.ewma_rate, data.mean_r + (data.k_multiplier * data.sigma_r));
+                    updateChart(entropyChart, data.entropy, data.mean_h - (data.k_multiplier * data.sigma_h));
+                }
 
                 // Protocol doughnut
                 protoChart.data.datasets[0].data = [data.proto_ratio, 1.0 - data.proto_ratio];
@@ -323,7 +612,6 @@
                     document.getElementById('latestMitigation').innerHTML = html;
                 }
             } catch (err) {
-                // Set engine state to offline
                 document.getElementById('engineStatusDot').className = 'status-dot offline';
                 document.getElementById('engineStatusText').innerText = 'GATEWAY TIMEOUT';
                 showToast('API Telemetry link failed!', 'warn');
@@ -335,57 +623,28 @@
             chart.data.datasets[0].data.push(val);
             chart.data.datasets[1].data.shift();
             chart.data.datasets[1].data.push(boundary);
-            chart.update('none'); // silent update
+            chart.update('none');
         }
 
         async function initCharts() {
-            try {
-                const res = await fetch('/api/history');
-                if (res.status === 401) {
-                    window.location.href = '/static/login.html';
-                    return;
-                }
-                const history = await res.json();
-                
-                if (history && history.length > 0) {
-                    const startIdx = Math.max(0, maxPoints - history.length);
-                    
-                    const rateData = rateChart.data.datasets[0].data;
-                    const rateBound = rateChart.data.datasets[1].data;
-                    
-                    const entropyData = entropyChart.data.datasets[0].data;
-                    const entropyBound = entropyChart.data.datasets[1].data;
-                    
-                    history.forEach((h, idx) => {
-                        const targetIdx = startIdx + idx;
-                        if (targetIdx < maxPoints) {
-                            rateData[targetIdx] = h.ewma_rate;
-                            rateBound[targetIdx] = h.mean_r + (h.k_multiplier * h.sigma_r);
-                            
-                            entropyData[targetIdx] = h.entropy;
-                            entropyBound[targetIdx] = h.mean_h - (h.k_multiplier * h.sigma_h);
-                        }
-                    });
-                    
-                    rateChart.update();
-                    entropyChart.update();
-                }
-            } catch (err) {
-                console.error("Failed to load history:", err);
+            await fetchState();
+            
+            // Auto-select first active/configured target if possible
+            const selectElement = document.getElementById('victimSelect');
+            if (selectElement.options.length > 1) {
+                selectedVictimIp = selectElement.options[1].value;
+                selectElement.value = selectedVictimIp;
+                await reloadTargetHistory();
             }
             
-            // Now run regular state fetch and start interval
-            await fetchState();
             setInterval(fetchState, 10000);
         }
 
-        // Logout handler
         document.getElementById('logoutBtn').addEventListener('click', async () => {
             await fetch('/api/logout', { method: 'POST' });
             window.location.href = '/static/login.html';
         });
 
-        // Initialize and tick
         initCharts();
     </script>
 </body>

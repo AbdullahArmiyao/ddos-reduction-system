@@ -68,9 +68,9 @@ use std::{
 pub const SOCKET_PATH: &str = "/tmp/ddos_stage1.sock";
 
 /// Wire size of one serialised `FeatureVector` in bytes.
-/// 9 fields × 8 bytes (f64) = 72 bytes + 16 bytes for IP address = 88 bytes.
-/// Python format: `struct.unpack('<9d16s', data)`
-pub const FEATURE_VECTOR_BYTES: usize = 88;
+/// 9 fields × 8 bytes (f64) = 72 bytes + 16 bytes for dominant IP + 16 bytes for victim IP = 104 bytes.
+/// Python format: `struct.unpack('<9d16s16s', data)`
+pub const FEATURE_VECTOR_BYTES: usize = 104;
 
 /// Anomaly flag: EWMA rate exceeded upper boundary (volume flood).
 /// Retained as a logging constant — no longer sent in the wire payload.
@@ -86,8 +86,8 @@ pub const FLAG_ENTROPY_ANOMALY: u8 = 0x02;
 
 /// The data payload handed to Stage 2 after every anomalous window.
 ///
-/// Wire format: 9 × f64 (little-endian) + 16 bytes IP address = 88 bytes total.
-/// Python unpacks with: `struct.unpack('<9d16s', data)`
+/// Wire format: 9 × f64 (little-endian) + 16 bytes dominant IP + 16 bytes victim IP = 104 bytes total.
+/// Python unpacks with: `struct.unpack('<9d16s16s', data)`
 ///
 /// Field order matches the Python unpack string exactly — **do not reorder**.
 #[derive(Debug, Clone)]
@@ -112,16 +112,18 @@ pub struct FeatureVector {
     pub timestamp: f64,
     /// The dominant IP address in this window (used for mitigation blocks).
     pub dominant_ip: std::net::IpAddr,
+    /// The victim destination IP address.
+    pub victim_ip: std::net::IpAddr,
 }
 
 impl FeatureVector {
     /// Serialise the feature vector into a fixed-size byte buffer.
     ///
     /// All numeric fields are written as **little-endian f64** to match
-    /// Python's `struct.unpack('<9d16s', data)` format string exactly.
+    /// Python's `struct.unpack('<9d16s16s', data)` format string exactly.
     ///
     /// # Returns
-    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 88 bytes, no padding, no surprises.
+    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 104 bytes, no padding, no surprises.
     pub fn to_bytes(&self) -> [u8; FEATURE_VECTOR_BYTES] {
         let mut buf = Vec::with_capacity(FEATURE_VECTOR_BYTES);
 
@@ -152,6 +154,14 @@ impl FeatureVector {
         };
         buf.write_all(&ip_v6.octets())
             .expect("write dominant_ip");
+
+        // Serialize victim_ip as 16 bytes (IPv6 or IPv6-mapped IPv4 address)
+        let vic_v6 = match self.victim_ip {
+            std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+            std::net::IpAddr::V6(v6) => v6,
+        };
+        buf.write_all(&vic_v6.octets())
+            .expect("write victim_ip");
 
         debug_assert_eq!(buf.len(), FEATURE_VECTOR_BYTES, "serialisation size mismatch");
         buf.try_into().expect("buf has exactly FEATURE_VECTOR_BYTES")
@@ -275,6 +285,7 @@ mod tests {
             dominant_ip_ratio: 0.66,
             timestamp:   1_700_000_000.0,
             dominant_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 4)),
+            victim_ip:   std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 3)),
         }
     }
 
@@ -283,7 +294,7 @@ mod tests {
     fn serialised_size_is_correct() {
         let bytes = sample_fv().to_bytes();
         assert_eq!(bytes.len(), FEATURE_VECTOR_BYTES);
-        assert_eq!(FEATURE_VECTOR_BYTES, 88);
+        assert_eq!(FEATURE_VECTOR_BYTES, 104);
     }
 
     /// Round-trip: serialise then re-parse with byteorder.
@@ -311,6 +322,10 @@ mod tests {
         std::io::Read::read_exact(&mut cur, &mut ip_bytes).unwrap();
         let dominant_ip = std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip_bytes));
 
+        let mut vic_bytes = [0u8; 16];
+        std::io::Read::read_exact(&mut cur, &mut vic_bytes).unwrap();
+        let victim_ip = std::net::IpAddr::V6(std::net::Ipv6Addr::from(vic_bytes));
+
         assert!((entropy           - 4.321           ).abs() < 1e-9);
         assert!((ewma_rate         - 1234.5          ).abs() < 1e-9);
         assert!((mean_h            - 4.800           ).abs() < 1e-9);
@@ -321,6 +336,7 @@ mod tests {
         assert!((dominant_ip_ratio - 0.66            ).abs() < 1e-9);
         assert!((timestamp         - 1_700_000_000.0 ).abs() < 1e-3);
         assert_eq!(dominant_ip, std::net::IpAddr::V6(std::net::Ipv4Addr::new(192, 168, 1, 4).to_ipv6_mapped()));
+        assert_eq!(victim_ip, std::net::IpAddr::V6(std::net::Ipv4Addr::new(10, 0, 0, 3).to_ipv6_mapped()));
     }
 
     /// FLAG constants must not overlap.

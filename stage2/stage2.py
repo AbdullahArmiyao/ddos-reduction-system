@@ -49,7 +49,7 @@ from reportlab.lib import colors
 SOCKET_PATH = "/tmp/ddos_stage1.sock"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "ddos_rf_model.joblib")
-FEATURE_VECTOR_FORMAT = "<9d16s"  # 9 x f64 (72 bytes) + 16-byte IP address = 88 bytes
+FEATURE_VECTOR_FORMAT = "<9d16s16s"  # 9 x f64 (72 bytes) + 16-byte dominant IP + 16-byte victim IP = 104 bytes
 PAYLOAD_SIZE = struct.calcsize(FEATURE_VECTOR_FORMAT)
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(SCRIPT_DIR, "stage2.db"))
@@ -104,6 +104,7 @@ last_metrics = {
     "cooldown": 0,
     "latest_classification": "Normal"
 }
+last_metrics_by_target = {}  # victim_ip -> last_metrics dict
 
 active_sessions = {}  # session_token -> last_active_timestamp
 
@@ -191,7 +192,7 @@ def setup_ipset():
 
 recently_blocked = {}
 
-def block_ip(ip, duration=3600):
+def block_ip(ip, duration=3600, victim_ip="Unknown"):
     """Add offending IP to ddos_blocklist."""
     global recently_blocked
     now = time.time()
@@ -214,7 +215,7 @@ def block_ip(ip, duration=3600):
         if res.returncode == 0:
             logging.warning(f"[!!!] MITIGATION TRIGGERED: Blocked offending IP {ip} (duration: {duration}s)")
             # Log to SQLite
-            log_incident(now, ip, "Blocked")
+            log_incident(now, ip, "Blocked", victim_ip)
         else:
             logging.error(f"[-] Failed to block IP {ip}: {res.stderr.strip()}")
     except Exception as e:
@@ -222,7 +223,7 @@ def block_ip(ip, duration=3600):
     finally:
         recently_blocked[ip] = now
 
-def ratelimit_ip(ip, duration=3600):
+def ratelimit_ip(ip, duration=3600, victim_ip="Unknown"):
     """Add offending IP to ddos_ratelimit set (enforces 50pps cap)."""
     global recently_blocked
     now = time.time()
@@ -245,7 +246,7 @@ def ratelimit_ip(ip, duration=3600):
         if res.returncode == 0:
             logging.warning(f"[!!!] MITIGATION TRIGGERED: Rate-limited offending IP {ip} (duration: {duration}s, 50pps cap)")
             # Log to SQLite
-            log_incident(now, ip, "Rate Limited")
+            log_incident(now, ip, "Rate Limited", victim_ip)
         else:
             logging.error(f"[-] Failed to rate-limit IP {ip}: {res.stderr.strip()}")
     except Exception as e:
@@ -370,13 +371,13 @@ def decode_ip(ip_bytes):
 # SQLite Audit Database Helpers
 # -----------------------------------------------------------------------------
 
-def log_incident(timestamp, src_ip, classification):
+def log_incident(timestamp, src_ip, classification, victim_ip="Unknown"):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO logs (timestamp, src_ip, dst_ip, proto, rate, entropy, classification) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (timestamp, src_ip, "10.0.0.3", "MIXED", last_metrics["ewma_rate"], last_metrics["entropy"], classification)
+            (timestamp, src_ip, victim_ip, "MIXED", last_metrics["ewma_rate"], last_metrics["entropy"], classification)
         )
         # Purge old logs to prevent size explosion (keep last 5000)
         cursor.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 5000)")
@@ -385,13 +386,13 @@ def log_incident(timestamp, src_ip, classification):
     except Exception as e:
         logging.error(f"[-] Failed to write incident to SQLite: {e}")
 
-def log_metrics_history(timestamp, rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k):
+def log_metrics_history(timestamp, rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k, victim_ip):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO metrics_history (timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k_multiplier) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (timestamp, rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k)
+            "INSERT INTO metrics_history (timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k_multiplier, victim_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (timestamp, rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k, victim_ip)
         )
         # Purge old metrics history (keep last 1000)
         cursor.execute("DELETE FROM metrics_history WHERE id NOT IN (SELECT id FROM metrics_history ORDER BY id DESC LIMIT 1000)")
@@ -465,6 +466,7 @@ def run_ipc_receiver():
                 dominant_ip_ratio = unpacked[7]
                 timestamp = unpacked[8]
                 ip_str = decode_ip(unpacked[9])
+                victim_ip_str = decode_ip(unpacked[10])
 
                 # Calculate delta features
                 delta_rate = ewma_rate - mean_r
@@ -514,11 +516,13 @@ def run_ipc_receiver():
                     "timestamp": timestamp,
                     "k_multiplier": 2.0,
                     "cooldown": 0,
-                    "latest_classification": pred_name
+                    "latest_classification": pred_name,
+                    "victim_ip": victim_ip_str
                 }
+                last_metrics_by_target[victim_ip_str] = last_metrics.copy()
 
                 # Save history
-                log_metrics_history(timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, 2.0)
+                log_metrics_history(timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, 2.0, victim_ip_str)
 
                 # Trigger block / rate-limit
                 if pred_class == 2:
@@ -530,7 +534,7 @@ def run_ipc_receiver():
                         dominant_rate = ewma_rate * dominant_ip_ratio
                         dominant_rate_threshold = mean_r + 2.0 * sigma_r
                         if dominant_ip_ratio >= 0.40 and dominant_rate >= dominant_rate_threshold:
-                            block_ip(ip_str)
+                            block_ip(ip_str, victim_ip=victim_ip_str)
                         else:
                             # Cluster Block Mode: Pivot to mitigation of distributed attackers (botnets)
                             # Parse active flows and rate-limit any flow that exceeds mean_r + sigma_r
@@ -552,7 +556,7 @@ def run_ipc_receiver():
                                             # If an individual flow in the cluster is sending >= flow_threshold, rate-limit it
                                             if f_ip not in ("Unknown", "0.0.0.0", "::") and f_rate >= flow_threshold:
                                                 logging.warning(f"[Cluster Block] Rate-limiting high-rate distributed flow: {f_ip} ({f_rate:.2f} pps, threshold: {flow_threshold:.2f} pps)")
-                                                ratelimit_ip(f_ip)
+                                                ratelimit_ip(f_ip, victim_ip=victim_ip_str)
                                                 cluster_blocked_any = True
                                 except Exception as ce:
                                     logging.error(f"[-] Cluster Block failed to parse flows: {ce}")
@@ -560,7 +564,7 @@ def run_ipc_receiver():
                                 logging.warning("[!] Cluster Block completed: No individual botnet flow exceeded adaptive threshold.")
                 elif pred_class == 1:
                     # Log flash crowd incident
-                    log_incident(timestamp, ip_str, "Flash Crowd")
+                    log_incident(timestamp, ip_str, "Flash Crowd", victim_ip_str)
                     # If the dominant IP rate is highly elevated during a flash crowd, apply rate-limit (not block)
                     dominant_rate = ewma_rate * dominant_ip_ratio
                     dominant_rate_threshold = mean_r + 2.0 * sigma_r
@@ -569,7 +573,7 @@ def run_ipc_receiver():
                             f"[!] Legitimate flash crowd dominant IP {ip_str} rate highly elevated "
                             f"({dominant_rate:.2f} pps). Applying rate-limit (50pps cap) as precaution."
                         )
-                        ratelimit_ip(ip_str)
+                        ratelimit_ip(ip_str, victim_ip=victim_ip_str)
 
             conn.close()
         except Exception as e:
@@ -700,7 +704,7 @@ def is_interface_promisc(ifname):
         return False
 
 @app.get("/api/state")
-def get_state():
+def get_state(target: Optional[str] = None):
     # Load flows
     active_flows = []
     if os.path.exists(FLOWS_PATH):
@@ -764,8 +768,30 @@ def get_state():
     except Exception:
         pass
 
+    # Select which target's metrics to return
+    metrics = last_metrics
+    if target:
+        metrics = last_metrics_by_target.get(target, {
+            "entropy": 0.0,
+            "ewma_rate": 0.0,
+            "mean_h": 0.0,
+            "mean_r": 0.0,
+            "sigma_h": 0.0,
+            "sigma_r": 0.0,
+            "proto_ratio": 1.0,
+            "dominant_ip_ratio": 0.0,
+            "timestamp": 0.0,
+            "k_multiplier": 2.0,
+            "cooldown": 0,
+            "latest_classification": "Normal",
+            "victim_ip": target
+        })
+    elif last_metrics_by_target:
+        first_target = next(iter(last_metrics_by_target.keys()))
+        metrics = last_metrics_by_target[first_target]
+
     return {
-        **last_metrics,
+        **metrics,
         "active_flows": active_flows,
         "whitelisted_ips": whitelist,
         "blocked_ips": blocked_ips_only,
@@ -774,18 +800,26 @@ def get_state():
         "victim_targets": victims,
         "interfaces": interfaces,
         "active_interface": active_interface,
-        "latest_logs": latest_logs
+        "latest_logs": latest_logs,
+        "last_metrics_by_target": last_metrics_by_target
     }
 
 @app.get("/api/history")
-def get_history():
+def get_history(target: Optional[str] = None):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k_multiplier "
-            "FROM metrics_history ORDER BY id DESC LIMIT 30"
-        )
+        if target:
+            cursor.execute(
+                "SELECT timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k_multiplier, victim_ip "
+                "FROM metrics_history WHERE victim_ip = ? ORDER BY id DESC LIMIT 30",
+                (target,)
+            )
+        else:
+            cursor.execute(
+                "SELECT timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k_multiplier, victim_ip "
+                "FROM metrics_history ORDER BY id DESC LIMIT 30"
+            )
         rows = cursor.fetchall()
         conn.close()
         
@@ -800,7 +834,8 @@ def get_history():
                 "mean_r": r[4],
                 "sigma_h": r[5],
                 "sigma_r": r[6],
-                "k_multiplier": r[7]
+                "k_multiplier": r[7],
+                "victim_ip": r[8] if len(r) > 8 else ""
             }
             for r in rows
         ]
@@ -1096,20 +1131,28 @@ def start_api_server():
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 
 def main():
-    # Ensure SQLite initialized
-    if not os.path.exists(DB_PATH):
-        logging.info("[+] DB missing; initializing database tables...")
-        # Create directories and run quick init
-        os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, salt TEXT)")
-        cursor.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, src_ip TEXT, dst_ip TEXT, proto TEXT, rate REAL, entropy REAL, classification TEXT)")
-        cursor.execute("CREATE TABLE IF NOT EXISTS metrics_history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, ewma_rate REAL, entropy REAL, mean_h REAL, mean_r REAL, sigma_h REAL, sigma_r REAL, k_multiplier REAL)")
-        # Insert default password just in case (setup_admin.py handles this properly)
-        cursor.execute("INSERT OR IGNORE INTO users VALUES ('admin', '4a0f4439c2794eb8f73111f1816e8e8156641d40a23277717469a4731c3c97e6', 'abcdef0123456789')")
-        conn.commit()
-        conn.close()
+    # Ensure SQLite initialized and migrated
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT, salt TEXT)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, src_ip TEXT, dst_ip TEXT, proto TEXT, rate REAL, entropy REAL, classification TEXT)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS metrics_history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, ewma_rate REAL, entropy REAL, mean_h REAL, mean_r REAL, sigma_h REAL, sigma_r REAL, k_multiplier REAL, victim_ip TEXT)")
+    
+    # Migration check: check if victim_ip column exists in metrics_history
+    cursor.execute("PRAGMA table_info(metrics_history)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "victim_ip" not in columns:
+        logging.info("[*] Migrating database: adding victim_ip column to metrics_history")
+        try:
+            cursor.execute("ALTER TABLE metrics_history ADD COLUMN victim_ip TEXT DEFAULT ''")
+        except Exception as me:
+            logging.error(f"[-] Migration failed: {me}")
+
+    # Insert default password just in case (setup_admin.py handles this properly)
+    cursor.execute("INSERT OR IGNORE INTO users VALUES ('admin', '4a0f4439c2794eb8f73111f1816e8e8156641d40a23277717469a4731c3c97e6', 'abcdef0123456789')")
+    conn.commit()
+    conn.close()
 
     # Ensure configs initialized
     load_json_file(WHITELIST_PATH, [])

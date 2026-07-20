@@ -96,6 +96,8 @@ pub struct PacketMeta {
     /// Source IP address extracted from the IP header.
     /// IPv4 addresses are stored as `IpAddr::V4`; IPv6 as `IpAddr::V6`.
     pub src_ip: IpAddr,
+    /// Destination IP address extracted from the IP header.
+    pub dst_ip: IpAddr,
     /// High-resolution monotonic timestamp recorded *immediately* after pcap
     /// delivers the frame to user space. Used by EWMA for inter-arrival timing.
     #[allow(dead_code)]
@@ -140,6 +142,7 @@ impl CaptureConfig {
     /// # Arguments
     /// * `interface`  — the name of the network bridge (e.g., `"br0"`).
     /// * `victim_ip`  — victim's IP address as a string (e.g., `"10.0.0.3"`).
+    #[allow(dead_code)]
     pub fn for_bridge(interface: &str, victim_ip: &str) -> Self {
         Self {
             interface:   interface.to_string(),
@@ -162,6 +165,27 @@ impl CaptureConfig {
             snaplen:     256,   // Capture only header bytes (optimizes memory copy speed under flood)
             timeout_ms:  100,
             promiscuous: true,  // Enable promiscuous mode to capture bridged transit traffic
+        }
+    }
+
+    /// Build BPF filter and capture configuration for multiple victim targets.
+    pub fn for_targets(interface: &str, targets: &crate::VictimTargets) -> Self {
+        let filter = match targets {
+            crate::VictimTargets::List(ips) => {
+                let hosts = ips.iter().map(|ip| format!("dst host {ip}")).collect::<Vec<_>>().join(" or ");
+                format!("(({hosts}) and ip) or (vlan and ({hosts}) and ip)")
+            }
+            crate::VictimTargets::Subnet { ip, prefix } => {
+                let net = format!("{ip}/{prefix}");
+                format!("(dst net {net} and ip) or (vlan and dst net {net} and ip)")
+            }
+        };
+        Self {
+            interface:   interface.to_string(),
+            bpf_filter:  filter,
+            snaplen:     256,
+            timeout_ms:  100,
+            promiscuous: true,
         }
     }
 }
@@ -297,14 +321,14 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
         };
 
         // -------------------------------------------------------------------------
-        // Step 5: Extract source IP from the IP header.
+        // Step 5: Extract source and destination IPs from the IP header.
         // -------------------------------------------------------------------------
-        let src_ip = match sliced.net {
+        let (src_ip, dst_ip) = match sliced.net {
             Some(InternetSlice::Ipv4(ref ipv4)) => {
-                IpAddr::from(ipv4.header().source_addr())
+                (IpAddr::from(ipv4.header().source_addr()), IpAddr::from(ipv4.header().destination_addr()))
             }
             Some(InternetSlice::Ipv6(ref ipv6)) => {
-                IpAddr::from(ipv6.header().source_addr())
+                (IpAddr::from(ipv6.header().source_addr()), IpAddr::from(ipv6.header().destination_addr()))
             }
             // Non-IP frame (ARP, etc.) — ignore.
             _ => continue,
@@ -323,7 +347,7 @@ pub fn run_capture_thread(cfg: CaptureConfig, tx: Sender<PacketMeta>) {
         // -------------------------------------------------------------------------
         // Step 6: Forward metadata to the analysis thread via the bounded channel.
         // -------------------------------------------------------------------------
-        let meta = PacketMeta { src_ip, arrived_at, protocol, dst_port };
+        let meta = PacketMeta { src_ip, dst_ip, arrived_at, protocol, dst_port };
 
         // `send()` blocks if the channel is full (backpressure).  This is the
         // correct behaviour — it prevents unbounded memory growth under flood.

@@ -471,8 +471,8 @@ The planned evolutionary milestones for future gateway iterations are structured
 
 | Version | Focus | Primary Goal | Description |
 | :--- | :--- | :--- | :--- |
-| **V3** | **Multi-Target Scaling** | Subnet-wide protection | Track and defend multiple victim IPs concurrently, keeping separate statistical baselines. Integrates egress/ingress rate auditing. |
-| **V4** | **Multi-Interface Scaling** | Perimeter-wide visibility | Aggregate traffic statistics from multiple ingress/egress interface ports to form unified network telemetry. |
+| **V3** | **Multi-Target Scaling** | Subnet-wide protection | Track and defend multiple victim IPs concurrently on a single ingress interface, keeping separate statistical baselines. |
+| **V4** | **Multi-Interface Scaling** | Perimeter-wide visibility | Aggregate traffic statistics from multiple interface ports. Spawns egress sniffers to enable ingress vs. egress rate telemetry auditing. |
 | **V5** | **XDP/eBPF Acceleration** | Kernel-space filtering | Port packet sniffer and early drop logic to eBPF/XDP driver path using Aya in Rust, scaling handling capacity to 10M+ pps. |
 | **V6** | **Ensemble Intelligence** | Complex classifier models | Deploy a multi-model voting ensemble layer to resolve advanced evasion/stealth attacks while maintaining low false positives. |
 
