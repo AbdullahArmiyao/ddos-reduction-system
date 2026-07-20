@@ -2,7 +2,7 @@
 name    = "ddos_stage1"
 version = "0.1.0"
 edition = "2024"
-authors = ["Abdullah Armiyao <***REMOVED***>"]
+authors = ["Abdullah Armiyao"]
 description = "Stage 1: Adaptive DDoS Pre-Filter — Packet Capture, Statistical Analysis, and Anomaly Detection"
 
 # ==============================================================================
