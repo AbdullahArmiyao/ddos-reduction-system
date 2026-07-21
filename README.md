@@ -534,10 +534,14 @@ The planned evolutionary milestones for future gateway iterations are structured
 
 | Version | Focus | Primary Goal | Description |
 | :--- | :--- | :--- | :--- |
+| **V1 (Completed)** | **Initial ML Pipeline** | Proof of concept | Basic feature extraction and initial Web UI dashboard setup. |
+| **V2 (Completed)** | **Adaptive Baselines** | Dynamic defenses | Implemented entropy-guided thresholds, cluster rate-limiting, and Welford poisoning defenses. |
 | **V3** | **Multi-Target Scaling** | Subnet-wide protection | Track and defend multiple victim IPs concurrently on a single ingress interface, keeping separate statistical baselines. |
-| **V4** | **Multi-Interface Scaling** | Perimeter-wide visibility | Aggregate traffic statistics from multiple interface ports. Spawns egress sniffers to enable ingress vs. egress rate telemetry auditing. |
-| **V5** | **XDP/eBPF Acceleration** | Kernel-space filtering | Port packet sniffer and early drop logic to eBPF/XDP driver path using Aya in Rust, scaling handling capacity to 10M+ pps. |
-| **V6** | **Ensemble Intelligence** | Complex classifier models | Deploy a multi-model voting ensemble layer to resolve advanced evasion/stealth attacks while maintaining low false positives. |
+| **V4** | **Baseline Persistence** | Persistent safe boundaries | Save and load Welford baselines across reboots to prevent baseline poisoning during active attack restarts. |
+| **V5** | **Multi-Interface Scaling** | Perimeter-wide visibility | Aggregate traffic statistics from multiple interface ports. Spawns egress sniffers to enable ingress vs. egress rate telemetry auditing. |
+| **V6** | **XDP/eBPF Acceleration** | Kernel-space filtering | Port packet sniffer and early drop logic to eBPF/XDP driver path using Aya in Rust, scaling handling capacity to 10M+ pps. |
+| **V7** | **Ensemble Intelligence** | Complex classifier models | Deploy a multi-model voting ensemble layer to resolve advanced evasion/stealth attacks while maintaining low false positives. |
+| **V8** | **Automated Playbooks** | Detailed Incident Response Plan | Generate dynamic, granular incident reports and execute automated multi-stage incident response playbooks during severe breaches. |
 
 ---
 
