@@ -409,8 +409,6 @@ def log_incident(timestamp, src_ip, classification, victim_ip="Unknown"):
             "INSERT INTO logs (timestamp, src_ip, dst_ip, proto, rate, entropy, classification) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (timestamp, src_ip, victim_ip, "MIXED", last_metrics.get("ewma_rate", 0.0), last_metrics.get("entropy", 0.0), classification)
         )
-        # Purge old logs to prevent size explosion (keep last 5000)
-        cursor.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 5000)")
         conn.commit()
         conn.close()
     except Exception as e:
@@ -617,6 +615,9 @@ def run_ipc_receiver():
                             f"({dominant_rate:.2f} pps). Applying rate-limit (50pps cap) as precaution."
                         )
                         ratelimit_ip(ip_str, victim_ip=victim_ip_str)
+                elif pred_class == 0:
+                    # Log normal traffic
+                    log_incident(timestamp, ip_str, "Normal", victim_ip_str)
 
             conn.close()
         except Exception as e:
@@ -791,7 +792,7 @@ def get_state(target: Optional[str] = None):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, src_ip, dst_ip, classification FROM logs ORDER BY id DESC LIMIT 5")
+        cursor.execute("SELECT timestamp, src_ip, dst_ip, classification FROM logs WHERE classification IN ('Blocked', 'Rate Limited', 'DDoS') ORDER BY id DESC LIMIT 5")
         latest_logs = [{"timestamp": r[0], "src_ip": r[1], "victim_ip": r[2], "classification": r[3]} for r in cursor.fetchall()]
         conn.close()
     except Exception:
@@ -962,10 +963,10 @@ def get_logs(classification: str = "ALL"):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         if classification == "ALL":
-            cursor.execute("SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs ORDER BY id DESC LIMIT 100")
+            cursor.execute("SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs ORDER BY id DESC")
         else:
             cursor.execute(
-                "SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs WHERE classification = ? ORDER BY id DESC LIMIT 100",
+                "SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs WHERE classification = ? ORDER BY id DESC",
                 (classification,)
             )
         rows = cursor.fetchall()
@@ -1117,6 +1118,46 @@ def export_pdf(payload: PdfReportPayload):
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ]))
         elements.append(t_charts)
+        elements.append(Spacer(1, 20))
+        
+        # Welford Baselines
+        elements.append(Paragraph("CURRENT SYSTEM BASELINES", header_style))
+        baseline_data = [
+            ["METRIC", "CURRENT STATE", "BASELINE LIMITS"],
+            ["Rate (PPS)", f"{last_metrics.get('ewma_rate', 0.0):.1f} pps", f"μ: {last_metrics.get('mean_r', 0.0):.1f} | σ: {last_metrics.get('sigma_r', 0.0):.1f} | μ+2σ: {last_metrics.get('mean_r', 0.0) + 2 * last_metrics.get('sigma_r', 0.0):.1f}"],
+            ["Entropy (bits)", f"{last_metrics.get('entropy', 0.0):.4f}", f"μ: {last_metrics.get('mean_h', 0.0):.4f} | σ: {last_metrics.get('sigma_h', 0.0):.4f} | μ-2σ: {last_metrics.get('mean_h', 0.0) - 2 * last_metrics.get('sigma_h', 0.0):.4f}"],
+            ["Protocol Ratios", "TCP / UDP / ICMP", f"{last_metrics.get('proto_tcp', 0.0):.1%} / {last_metrics.get('proto_udp', 0.0):.1%} / {last_metrics.get('proto_icmp', 0.0):.1%}"]
+        ]
+        t_base = Table(baseline_data, colWidths=[120, 150, 270])
+        t_base.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#00a2b0')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 6),
+            ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f9f9f9')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#dddddd')),
+        ]))
+        elements.append(t_base)
+        elements.append(Spacer(1, 20))
+
+        # Blocked IPs
+        elements.append(Paragraph(f"ACTIVE MITIGATION TARGETS (TOP 10)", header_style))
+        blocked_data = [["BLOCKED IP", "REMAINING TIME (S)"]]
+        for b in blocked_ips[:10]:
+            blocked_data.append([b["ip"], str(b["remaining_seconds"])])
+        if len(blocked_ips) == 0:
+            blocked_data.append(["NO ACTIVE BLOCKS", "N/A"])
+        
+        t_blocked = Table(blocked_data, colWidths=[300, 240])
+        t_blocked.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#00a2b0')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 6),
+            ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f9f9f9')),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#dddddd')),
+        ]))
+        elements.append(t_blocked)
         elements.append(Spacer(1, 20))
 
         # Recent Logs Table

@@ -637,8 +637,8 @@ fn write_active_flows(flow_counts: &HashMap<(IpAddr, u16, u8), u32>, timestamp: 
     let mut flows: Vec<_> = flow_counts.iter().collect();
     flows.sort_by(|a, b| b.1.cmp(a.1));
     
-    // Take top 20 active flows to prevent massive files
-    let top_flows = flows.into_iter().take(20);
+    // Write all active network flows
+    let all_flows = flows.into_iter();
     
     let mut json = String::new();
     json.push_str("{\n  \"timestamp\": ");
@@ -646,7 +646,7 @@ fn write_active_flows(flow_counts: &HashMap<(IpAddr, u16, u8), u32>, timestamp: 
     json.push_str(",\n  \"active_ips\": [\n");
     
     let mut first = true;
-    for (key, count_ref) in top_flows {
+    for (key, count_ref) in all_flows {
         let (ip, port, proto) = *key;
         let count = *count_ref;
         if !first {
