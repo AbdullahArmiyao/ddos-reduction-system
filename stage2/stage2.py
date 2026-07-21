@@ -283,7 +283,7 @@ def ratelimit_ip(ip, duration=3600, victim_ip="Unknown"):
     finally:
         recently_blocked[ip] = now
 
-def unblock_ip(ip):
+def unblock_ip(ip, victim_ip="Unknown"):
     """Remove IP from both ddos_blocklist and ddos_ratelimit."""
     try:
         res1 = subprocess.run(
@@ -298,6 +298,7 @@ def unblock_ip(ip):
         )
         if res1.returncode == 0 or res2.returncode == 0:
             logging.info(f"[+] Released firewall block/rate-limit for IP {ip}")
+            log_incident(time.time(), ip, "Released", victim_ip)
             return True
         else:
             logging.error(f"[-] Failed to release IP {ip}: {res1.stderr.strip()} / {res2.stderr.strip()}")
@@ -952,7 +953,7 @@ def manual_block(payload: IpPayload):
 
 @app.post("/api/firewall/unblock")
 def manual_unblock(payload: IpPayload):
-    if unblock_ip(payload.ip):
+    if unblock_ip(payload.ip, victim_ip=payload.victim_ip):
         return {"status": "success"}
     raise HTTPException(status_code=500, detail="Failed to release firewall block.")
 
@@ -964,6 +965,8 @@ def get_logs(classification: str = "ALL"):
         cursor = conn.cursor()
         if classification == "ALL":
             cursor.execute("SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs ORDER BY id DESC")
+        elif classification == "DDoS":
+            cursor.execute("SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs WHERE classification IN ('Blocked', 'Rate Limited', 'DDoS') ORDER BY id DESC")
         else:
             cursor.execute(
                 "SELECT timestamp, src_ip, dst_ip, proto, rate, entropy, classification FROM logs WHERE classification = ? ORDER BY id DESC",
@@ -1161,11 +1164,11 @@ def export_pdf(payload: PdfReportPayload):
         elements.append(Spacer(1, 20))
 
         # Recent Logs Table
-        elements.append(Paragraph("LATEST RECORDED THREAT METADATA (LAST 5 INCIDENTS)", header_style))
+        elements.append(Paragraph("LATEST RECORDED THREAT METADATA (LAST 100 INCIDENTS)", header_style))
         
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, src_ip, dst_ip, rate, entropy, classification FROM logs ORDER BY id DESC LIMIT 5")
+        cursor.execute("SELECT timestamp, src_ip, dst_ip, rate, entropy, classification FROM logs ORDER BY id DESC LIMIT 100")
         rows = cursor.fetchall()
         conn.close()
 

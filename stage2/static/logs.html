@@ -127,11 +127,14 @@
                     let classStyle = 'text-normal';
                     let badgeClass = 'badge badge-normal';
                     
-                    if (l.classification === 'DDoS') {
+                    if (['DDoS', 'Blocked', 'Rate Limited'].includes(l.classification)) {
                         classStyle = 'text-ddos';
                         badgeClass = 'badge badge-ddos';
                     } else if (l.classification === 'Flash Crowd') {
                         classStyle = 'text-flash';
+                        badgeClass = 'badge badge-flash';
+                    } else if (l.classification === 'Released') {
+                        classStyle = 'text-normal';
                         badgeClass = 'badge badge-flash';
                     }
 
