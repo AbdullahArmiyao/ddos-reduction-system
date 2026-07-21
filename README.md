@@ -66,10 +66,10 @@ Every packet that enters the ingress interface addressed to the victim goes thro
 [ LAYER 1: per-packet — Analysis Thread ]
    └── EntropyAccumulator::add(src_ip)   increments IP frequency counter
          │
-         │  (every 50th packet — window closes)
+         │  (window closes at >= 0.5s & 20 pkts, or 1.0s max)
          ▼
 [ LAYER 2: per-window ]
-   ├── h = entropy.compute_and_reset()   → diversity scalar  [0.0 .. 5.64 bits]
+   ├── h = entropy.compute_and_reset()   → diversity scalar  [0.0 .. 1.0] (Normalized)
    └── r = ewma.update(window_duration)  → rate scalar       [0.0 .. ∞ pps]
          │
          ▼
@@ -125,9 +125,9 @@ Then: `variance = M2 / (n - 1)`
 **The problem it solves:** You need a *rate* (packets per second) that reacts quickly to floods but isn't thrown off by a single bursty packet interval or scheduling delays.
 
 **How it works (Jitter-Resistant design):**
-Instead of updating the EWMA rate per packet (which suffers from massive timing jitter spikes due to OS interrupt coalescing or virtualization scheduling), Stage 1 calculates the rate **once per 50-packet window** using the window's exact elapsed time:
+Instead of updating the EWMA rate per packet (which suffers from massive timing jitter spikes due to OS interrupt coalescing or virtualization scheduling), Stage 1 calculates the rate **once per hybrid time window** using the window's exact elapsed time:
 ```
-window_rate = WINDOW_SIZE / window_duration_seconds
+window_rate = actual_packets_received / window_duration_seconds
 ewma_new    = α · window_rate + (1 − α) · ewma_old
 ```
 
@@ -148,25 +148,26 @@ ewma_new    = α · window_rate + (1 − α) · ewma_old
 
 **The problem it solves:** Raw packet count can't distinguish a DDoS from a flash crowd — both produce high volume. Unique IP count misses distribution shape — ten IPs each sending five packets looks the same as one IP sending 41 packets and nine others sending one each. Shannon Entropy captures the *full probability distribution* of source IPs in a single number.
 
-**The formula:**
+**The formula (Normalized Entropy):**
 
 ```
-H(X) = −Σ p(xᵢ) · log₂(p(xᵢ))
+H_raw = −Σ p(xᵢ) · log₂(p(xᵢ))
+H_norm = H_raw / log₂(N)   (where N is number of unique IPs)
 ```
 
 Where `p(xᵢ)` is the fraction of packets in the current window that came from IP `xᵢ`.
 
-**Interpretation for a 50-packet window:**
+**Interpretation (Independent of Traffic Volume):**
 
-| Scenario | Entropy |
+| Scenario | Normalized Entropy |
 |---|---|
-| All 50 packets from one IP | **0.0 bits** (total concentration — DDoS) |
-| 25 packets each from 2 IPs | **1.0 bit** |
-| 50 packets from 50 unique IPs | **≈ 5.64 bits** (maximum diversity — normal) |
+| All packets from one IP | **0.00** (total concentration — DDoS) |
+| Packets somewhat mixed | **~0.50** |
+| Packets evenly spread across all IPs | **1.00** (maximum diversity — normal/flash crowd) |
 
 **Why entropy *drops* during DDoS:** A flood from a spoofed or single source concentrates packets toward one IP, collapsing the distribution and dragging entropy toward zero. Layer 3 fires when entropy drops *below* `μ − k·σ` rather than above it.
 
-**Critical behaviour — entropy resets every window.** The HashMap is cleared after each computation. Entropy measures the diversity of *this* 50-packet batch, not a historical trend. The long-run trend is tracked by the Welford accumulator.
+**Critical behaviour — entropy resets every window.** The HashMap is cleared after each computation. Entropy measures the diversity of *this* specific window, not a historical trend. The long-run trend is tracked by the Welford accumulator.
 
 ---
 
@@ -368,17 +369,17 @@ RUST_LOG=warn   # anomalies and errors only
 [INFO] BPF filter target victim IP = 10.0.0.3
 [INFO] Capture: capture loop started on 'br0'
 
-# Warmup (first 10,000 packets = 200 windows)
-[INFO] Analysis: warm-up window 1/200   | r=0.0 pps   | h=0.000 bits
-[INFO] Analysis: warm-up window 100/200 | r=842.3 pps  | h=4.821 bits
-[INFO] Analysis: warm-up window 200/200 | r=917.1 pps  | h=5.103 bits
+# Warmup (first 200 windows)
+[INFO] Analysis: warm-up window 1/200   | r=0.0 pps   | h=0.000
+[INFO] Analysis: warm-up window 100/200 | r=842.3 pps  | h=0.921
+[INFO] Analysis: warm-up window 200/200 | r=917.1 pps  | h=0.985
 
 # Normal operation — silence at INFO level (no news = good news)
 # With RUST_LOG=debug:
-[DEBUG] Window #31: NORMAL | r=103.2 | h=4.91
+[DEBUG] Window #31: NORMAL | r=103.2 | h=0.971
 
 # Anomaly detected
-[WARN] ANOMALY window #47 | flags=0x03 | r=58291.4 (boundary=2341.1) | h=0.031 (boundary=3.218) | dom_ratio=0.980
+[WARN] ANOMALY window #47 | flags=0x03 | r=58291.4 (boundary=2341.1) | h=0.012 (boundary=0.650) | dom_ratio=0.980
 
 # Clean shutdown (Ctrl+C)
 [INFO] Analysis: channel closed; processed 47 windows total. Exiting.

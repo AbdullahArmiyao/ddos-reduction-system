@@ -356,7 +356,7 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory="$STAGE2_DIR"
-ExecStart="$STAGE2_DIR/venv/bin/python" stage2.py
+ExecStart=/bin/bash -c 'source "$STAGE2_DIR/venv/bin/activate" && exec python3 stage2.py'
 Restart=on-failure
 RestartSec=5s
 Environment="PYTHONUNBUFFERED=1"
