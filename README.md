@@ -199,7 +199,7 @@ Stage 2 uses this flag plus four additional features in the Random Forest to mak
 
 When Stage 1 flags an anomaly, it serialises a `FeatureVector` struct and sends it over a Unix Domain Socket to Stage 2 (Python).
 
-The wire format is **exactly 152 bytes, little-endian**:
+The wire format is **exactly 168 bytes, little-endian**:
 
 | Offset | Size | Field | Type | Description |
 |---|---|---|---|---|
@@ -218,10 +218,14 @@ The wire format is **exactly 152 bytes, little-endian**:
 | 96 | 8 bytes | `proto_sctp` | f64 | SCTP packet ratio |
 | 104 | 8 bytes | `proto_gre` | f64 | GRE packet ratio |
 | 112 | 8 bytes | `proto_esp` | f64 | ESP packet ratio |
-| 120 | 16 bytes | `dominant_ip` | [u8; 16] | Busiest source IP (IPv6 or mapped IPv4) |
-| 136 | 16 bytes | `victim_ip` | [u8; 16] | Monitored victim IP address |
+| 120 | 8 bytes | `k_multiplier` | f64 | Operative anomaly-boundary multiplier for this window (`cfg.k`, halved during cooldown recovery) |
+| 128 | 8 bytes | `cooldown_counter` | f64 | Windows remaining in cooldown recovery (0–10) |
+| 136 | 16 bytes | `dominant_ip` | [u8; 16] | Busiest source IP (IPv6 or mapped IPv4) |
+| 152 | 16 bytes | `victim_ip` | [u8; 16] | Monitored victim IP address |
 
-Python unpacks it with: `struct.unpack('<15d16s16s', data)`
+Python unpacks it with: `struct.unpack('<17d16s16s', data)`
+
+`k_multiplier` and `cooldown_counter` exist so Stage 2 never has to guess Stage 1's live sensitivity: earlier versions hardcoded `2.0`/`0` on the Python side for these, which silently diverged from Stage 1's real (and cooldown-adjusted) `k` the moment `--k` was set to anything non-default. Stage 2 now uses the transmitted `k_multiplier` for its own anomaly-boundary and mitigation-threshold checks instead of a fixed constant.
 
 Fields are written manually with `byteorder` rather than transmuting the Rust struct directly. This eliminates invisible padding bugs — Rust structs can insert alignment padding that `struct.unpack` wouldn't know about.
 
@@ -472,7 +476,7 @@ sudo bash scripts/uninstall.sh --remove-build --remove-rust
 
 ## Stage 2 Integration (Python)
 
-Stage 2 listens on the Unix domain socket `/tmp/ddos_stage1.sock`, unpacks the incoming 152-byte `FeatureVector` structs, and classifies traffic in real-time. It operates as a FastAPI application with a persistent SQLite storage layer and a dynamic Chart.js dashboard.
+Stage 2 listens on the Unix domain socket `/tmp/ddos_stage1.sock`, unpacks the incoming 168-byte `FeatureVector` structs, and classifies traffic in real-time. It operates as a FastAPI application with a persistent SQLite storage layer and a dynamic Chart.js dashboard.
 
 
 The features unpacked from the Feature Vector:
