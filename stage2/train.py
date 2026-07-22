@@ -53,6 +53,9 @@ def main():
     # Drop rows with NaN or infinite values
     df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
     
+    # Filter out flash-crowd warm-up rows (rate < 100) that blur the boundary with Normal traffic
+    df = df[~((df[LABEL_COL] == 1) & (df["ewma_rate"] < 100))].reset_index(drop=True)
+    
     # Calculate delta features
     df["delta_rate"] = df["ewma_rate"] - df["mean_r"]
     df["delta_entropy"] = df["entropy"] - df["mean_h"]
@@ -107,7 +110,10 @@ def main():
                 "Mean Rate": lbl_df["ewma_rate"].mean(),
                 "Min Entropy": lbl_df["entropy"].min(),
                 "Max Entropy": lbl_df["entropy"].max(),
-                "Mean Entropy": lbl_df["entropy"].mean()
+                "Mean Entropy": lbl_df["entropy"].mean(),
+                "Min Dominant IP Ratio": lbl_df["dominant_ip_ratio"].min(),
+                "Max Dominant IP Ratio": lbl_df["dominant_ip_ratio"].max(),
+                "Mean Dominant IP Ratio": lbl_df["dominant_ip_ratio"].mean()
             })
     print(pd.DataFrame(overlap_info).to_string(index=False))
 
@@ -136,95 +142,7 @@ def main():
     X_test = df.loc[test_indices, FEATURE_COLS].copy()
     y_test = df.loc[test_indices, LABEL_COL].copy()
 
-    # 4. Inject Synthetic cases in the training set ONLY
-    print("\n[+] Injecting synthetic edge cases into training set ONLY...")
-    synthetic_rows = []
-    
-    # 50 Single-Source DDoS cases (UDP/ICMP floods)
-    for _ in range(50):
-        synthetic_rows.append({
-            "entropy": np.random.uniform(0.0, 1.5),
-            "ewma_rate": np.random.uniform(10000.0, 150000.0),
-            "mean_h": np.random.uniform(3.5, 4.5),
-            "mean_r": np.random.uniform(20.0, 100.0),
-            "sigma_h": np.random.uniform(0.05, 0.2),
-            "sigma_r": np.random.uniform(5.0, 15.0),
-            "proto_ratio": np.random.uniform(0.0, 0.3),
-            "dominant_ip_ratio": np.random.uniform(0.6, 1.0),
-            "delta_rate": np.random.uniform(9900.0, 149900.0),
-            "delta_entropy": np.random.uniform(-4.5, -2.0),
-            LABEL_COL: 2
-        })
-        
-    # 50 Single-Source DDoS cases (TCP floods)
-    for _ in range(50):
-        synthetic_rows.append({
-            "entropy": np.random.uniform(0.0, 1.5),
-            "ewma_rate": np.random.uniform(10000.0, 150000.0),
-            "mean_h": np.random.uniform(3.5, 4.5),
-            "mean_r": np.random.uniform(20.0, 100.0),
-            "sigma_h": np.random.uniform(0.05, 0.2),
-            "sigma_r": np.random.uniform(5.0, 15.0),
-            "proto_ratio": np.random.uniform(0.7, 1.0),
-            "dominant_ip_ratio": np.random.uniform(0.6, 1.0),
-            "delta_rate": np.random.uniform(9900.0, 149900.0),
-            "delta_entropy": np.random.uniform(-4.5, -2.0),
-            LABEL_COL: 2
-        })
-
-    # 100 Spoofed / Distributed DDoS cases (High rate, high entropy, low dominant IP)
-    for _ in range(100):
-        synthetic_rows.append({
-            "entropy": np.random.uniform(3.5, 5.5),
-            "ewma_rate": np.random.uniform(15000.0, 150000.0),
-            "mean_h": np.random.uniform(3.5, 4.5),
-            "mean_r": np.random.uniform(20.0, 100.0),
-            "sigma_h": np.random.uniform(0.05, 0.2),
-            "sigma_r": np.random.uniform(5.0, 15.0),
-            "proto_ratio": np.random.uniform(0.0, 1.0),
-            "dominant_ip_ratio": np.random.uniform(0.01, 0.25),
-            "delta_rate": np.random.uniform(14900.0, 149900.0),
-            "delta_entropy": np.random.uniform(-0.5, 0.5),
-            LABEL_COL: 2
-        })
-        
-    # 100 Flash Crowd cases (Moderate-high rate, high entropy, low dominant IP)
-    for _ in range(100):
-        synthetic_rows.append({
-            "entropy": np.random.uniform(3.5, 5.5),
-            "ewma_rate": np.random.uniform(2000.0, 8000.0),
-            "mean_h": np.random.uniform(3.5, 4.5),
-            "mean_r": np.random.uniform(20.0, 100.0),
-            "sigma_h": np.random.uniform(0.05, 0.2),
-            "sigma_r": np.random.uniform(5.0, 15.0),
-            "proto_ratio": np.random.uniform(0.7, 1.0),
-            "dominant_ip_ratio": np.random.uniform(0.01, 0.2),
-            "delta_rate": np.random.uniform(1900.0, 7900.0),
-            "delta_entropy": np.random.uniform(-0.5, 0.5),
-            LABEL_COL: 1
-        })
-        
-    # 100 Clean Normal cases (Low rate, varying entropy and dominant IP)
-    for _ in range(100):
-        synthetic_rows.append({
-            "entropy": np.random.uniform(1.0, 5.5),
-            "ewma_rate": np.random.uniform(5.0, 800.0),
-            "mean_h": np.random.uniform(1.0, 5.5),
-            "mean_r": np.random.uniform(5.0, 800.0),
-            "sigma_h": np.random.uniform(0.05, 0.5),
-            "sigma_r": np.random.uniform(1.0, 50.0),
-            "proto_ratio": np.random.uniform(0.0, 1.0),
-            "dominant_ip_ratio": np.random.uniform(0.02, 0.6),
-            "delta_rate": np.random.uniform(-100.0, 100.0),
-            "delta_entropy": np.random.uniform(-0.5, 0.5),
-            LABEL_COL: 0
-        })
-        
-    df_synthetic = pd.DataFrame(synthetic_rows)
-    X_train = pd.concat([X_train, df_synthetic[FEATURE_COLS]], ignore_index=True)
-    y_train = pd.concat([y_train, df_synthetic[LABEL_COL]], ignore_index=True)
-
-    # 5. Balance classes on the training split ONLY
+    # 4. Balance classes on the training split ONLY
     train_df = X_train.copy()
     train_df[LABEL_COL] = y_train.values
     
@@ -257,7 +175,6 @@ def main():
         n_estimators=100,
         max_depth=5,
         random_state=42,
-        class_weight="balanced",
         n_jobs=-1
     )
     clf.fit(X_train, y_train)
