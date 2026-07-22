@@ -49,7 +49,7 @@ from reportlab.lib import colors
 SOCKET_PATH = "/tmp/ddos_stage1.sock"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "ddos_rf_model.joblib")
-FEATURE_VECTOR_FORMAT = "<15d16s16s"  # 15 x f64 (120 bytes) + 16-byte dominant IP + 16-byte victim IP = 152 bytes
+FEATURE_VECTOR_FORMAT = "<17d16s16s"  # 17 x f64 (136 bytes) + 16-byte dominant IP + 16-byte victim IP = 168 bytes
 PAYLOAD_SIZE = struct.calcsize(FEATURE_VECTOR_FORMAT)
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(SCRIPT_DIR, "stage2.db"))
@@ -500,8 +500,10 @@ def run_ipc_receiver():
                 proto_sctp = unpacked[12]
                 proto_gre = unpacked[13]
                 proto_esp = unpacked[14]
-                ip_str = decode_ip(unpacked[15])
-                victim_ip_str = decode_ip(unpacked[16])
+                k_multiplier = unpacked[15]
+                cooldown_counter = unpacked[16]
+                ip_str = decode_ip(unpacked[17])
+                victim_ip_str = decode_ip(unpacked[18])
                 victim_ip_str = resolve_victim_ip(victim_ip_str)
 
                 # Calculate delta features
@@ -521,12 +523,12 @@ def run_ipc_receiver():
                     pred_class = int(clf.predict(features_df)[0])
 
                 # Adaptive Safety overrides
-                # 1. Rate anomaly trigger: mean_r + 2.0 * sigma_r
-                rate_anomaly_boundary = mean_r + 2.0 * sigma_r
-                # 2. Extreme rate trigger: mean_r + 10.0 * sigma_r
+                # 1. Rate anomaly trigger: mean_r + k_multiplier * sigma_r (mirrors Stage 1's live k)
+                rate_anomaly_boundary = mean_r + k_multiplier * sigma_r
+                # 2. Extreme rate trigger: mean_r + 10.0 * sigma_r (mirrors Stage 1's fixed emergency-volume cap)
                 extreme_rate_boundary = mean_r + 10.0 * sigma_r
-                # 3. Entropy anomaly trigger: mean_h - 2.0 * sigma_h
-                entropy_anomaly_boundary = mean_h - 2.0 * sigma_h
+                # 3. Entropy anomaly trigger: mean_h - k_multiplier * sigma_h (mirrors Stage 1's live k)
+                entropy_anomaly_boundary = mean_h - k_multiplier * sigma_h
 
                 if pred_class in (0, 1) and ewma_rate > rate_anomaly_boundary:
                     if ewma_rate > extreme_rate_boundary:
@@ -550,8 +552,8 @@ def run_ipc_receiver():
                     "proto_ratio": proto_ratio,
                     "dominant_ip_ratio": dominant_ip_ratio,
                     "timestamp": timestamp,
-                    "k_multiplier": 2.0,
-                    "cooldown": 0,
+                    "k_multiplier": k_multiplier,
+                    "cooldown": int(cooldown_counter),
                     "latest_classification": pred_name,
                     "victim_ip": victim_ip_str,
                     "proto_tcp": proto_tcp,
@@ -564,17 +566,17 @@ def run_ipc_receiver():
                 last_metrics_by_target[victim_ip_str] = last_metrics.copy()
 
                 # Save history
-                log_metrics_history(timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, 2.0, victim_ip_str)
+                log_metrics_history(timestamp, ewma_rate, entropy, mean_h, mean_r, sigma_h, sigma_r, k_multiplier, victim_ip_str)
 
                 # Trigger block / rate-limit
                 if pred_class == 2:
                     if ip_str not in ("Unknown", "0.0.0.0", "::"):
                         # Guard: Only block the dominant IP if:
                         # 1. It represents a significant portion of the traffic (ratio >= 40%).
-                        # 2. Its individual packet rate exceeds the dynamic malicious threshold (mean_r + 2.0 * sigma_r).
+                        # 2. Its individual packet rate exceeds the dynamic malicious threshold (mean_r + k_multiplier * sigma_r).
                         # This prevents collateral damage on legitimate flash crowd users and post-mitigation decay tails.
                         dominant_rate = ewma_rate * dominant_ip_ratio
-                        dominant_rate_threshold = mean_r + 2.0 * sigma_r
+                        dominant_rate_threshold = mean_r + k_multiplier * sigma_r
                         if dominant_ip_ratio >= 0.40 and dominant_rate >= dominant_rate_threshold:
                             block_ip(ip_str, victim_ip=victim_ip_str)
                         else:
@@ -609,7 +611,7 @@ def run_ipc_receiver():
                     log_incident(timestamp, ip_str, "Flash Crowd", victim_ip_str)
                     # If the dominant IP rate is highly elevated during a flash crowd, apply rate-limit (not block)
                     dominant_rate = ewma_rate * dominant_ip_ratio
-                    dominant_rate_threshold = mean_r + 2.0 * sigma_r
+                    dominant_rate_threshold = mean_r + k_multiplier * sigma_r
                     if ip_str not in ("Unknown", "0.0.0.0", "::") and dominant_ip_ratio >= 0.40 and dominant_rate >= dominant_rate_threshold:
                         logging.warning(
                             f"[!] Legitimate flash crowd dominant IP {ip_str} rate highly elevated "

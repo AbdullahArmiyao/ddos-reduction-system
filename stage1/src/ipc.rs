@@ -1,4 +1,4 @@
-// =============================================================================
+ // =============================================================================
 // ipc.rs — Inter-Process Communication: Rust → Python Feature Vector
 // =============================================================================
 //
@@ -22,17 +22,28 @@
 // into an explicitly sized byte buffer rather than transmuting the Rust struct
 // directly. The Python-side format string is therefore:
 //
-//   struct.unpack('<8d', data)   →   8 × 8 = 64 bytes
+//   struct.unpack('<17d16s16s', data)   →   17 × 8 + 16 + 16 = 168 bytes
 //
-//   Field order on the wire (all little-endian f64):
-//     [0..8]   entropy      — Shannon entropy h (bits, 0.0..5.64)
-//     [8..16]  ewma_rate    — EWMA rate snapshot r (packets/sec)
-//     [16..24] mean_h       — Welford entropy baseline
-//     [24..32] mean_r       — Welford rate baseline
-//     [32..40] sigma_h      — entropy standard deviation
-//     [40..48] sigma_r      — rate standard deviation
-//     [48..56] proto_ratio  — TCP fraction of window (0.0..1.0)
-//     [56..64] timestamp    — window close time (UNIX seconds, f64)
+//   Field order on the wire (all little-endian f64 unless noted):
+//     [0..8]     entropy           — Shannon entropy h (bits, 0.0..5.64)
+//     [8..16]    ewma_rate         — EWMA rate snapshot r (packets/sec)
+//     [16..24]   mean_h            — Welford entropy baseline
+//     [24..32]   mean_r            — Welford rate baseline
+//     [32..40]   sigma_h           — entropy standard deviation
+//     [40..48]   sigma_r           — rate standard deviation
+//     [48..56]   proto_ratio       — TCP fraction of window (0.0..1.0)
+//     [56..64]   dominant_ip_ratio — fraction of packets from busiest IP
+//     [64..72]   timestamp         — window close time (UNIX seconds, f64)
+//     [72..80]   proto_tcp         — TCP fraction of window
+//     [80..88]   proto_udp         — UDP fraction of window
+//     [88..96]   proto_icmp        — ICMP fraction of window
+//     [96..104]  proto_sctp        — SCTP fraction of window
+//     [104..112] proto_gre         — GRE fraction of window
+//     [112..120] proto_esp         — ESP fraction of window
+//     [120..128] k_multiplier      — operative anomaly-boundary multiplier
+//     [128..136] cooldown_counter  — windows remaining in cooldown (0..10)
+//     [136..152] dominant_ip       — 16-byte IPv6/IPv6-mapped-IPv4 address
+//     [152..168] victim_ip         — 16-byte IPv6/IPv6-mapped-IPv4 address
 //
 // ANOMALY FLAGS BITMASK (retained as constants for logging; not sent on wire)
 // ---------------------------------------------------------------------------
@@ -68,9 +79,9 @@ use std::{
 pub const SOCKET_PATH: &str = "/tmp/ddos_stage1.sock";
 
 /// Wire size of one serialised `FeatureVector` in bytes.
-/// 15 fields × 8 bytes (f64) = 120 bytes + 16 bytes for dominant IP + 16 bytes for victim IP = 152 bytes.
-/// Python format: `struct.unpack('<15d16s16s', data)`
-pub const FEATURE_VECTOR_BYTES: usize = 152;
+/// 17 fields × 8 bytes (f64) = 136 bytes + 16 bytes for dominant IP + 16 bytes for victim IP = 168 bytes.
+/// Python format: `struct.unpack('<17d16s16s', data)`
+pub const FEATURE_VECTOR_BYTES: usize = 168;
 
 /// Anomaly flag: EWMA rate exceeded upper boundary (volume flood).
 /// Retained as a logging constant — no longer sent in the wire payload.
@@ -86,8 +97,8 @@ pub const FLAG_ENTROPY_ANOMALY: u8 = 0x02;
 
 /// The data payload handed to Stage 2 after every anomalous window.
 ///
-/// Wire format: 15 × f64 (little-endian) + 16 bytes dominant IP + 16 bytes victim IP = 152 bytes total.
-/// Python unpacks with: `struct.unpack('<15d16s16s', data)`
+/// Wire format: 17 × f64 (little-endian) + 16 bytes dominant IP + 16 bytes victim IP = 168 bytes total.
+/// Python unpacks with: `struct.unpack('<17d16s16s', data)`
 ///
 /// Field order matches the Python unpack string exactly — **do not reorder**.
 #[derive(Debug, Clone)]
@@ -122,6 +133,11 @@ pub struct FeatureVector {
     pub proto_gre: f64,
     /// Ratio of ESP packets in window.
     pub proto_esp: f64,
+    /// Operative anomaly-boundary multiplier for this window (`cfg.k`,
+    /// halved during cooldown recovery — see `analysis.rs`'s `base_k`).
+    pub k_multiplier: f64,
+    /// Windows remaining in the cooldown recovery period (0..10).
+    pub cooldown_counter: f64,
     /// The dominant IP address in this window (used for mitigation blocks).
     pub dominant_ip: std::net::IpAddr,
     /// The victim destination IP address.
@@ -132,10 +148,10 @@ impl FeatureVector {
     /// Serialise the feature vector into a fixed-size byte buffer.
     ///
     /// All numeric fields are written as **little-endian f64** to match
-    /// Python's `struct.unpack('<15d16s16s', data)` format string exactly.
+    /// Python's `struct.unpack('<17d16s16s', data)` format string exactly.
     ///
     /// # Returns
-    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 152 bytes, no padding, no surprises.
+    /// `[u8; FEATURE_VECTOR_BYTES]` — exactly 168 bytes, no padding, no surprises.
     pub fn to_bytes(&self) -> [u8; FEATURE_VECTOR_BYTES] {
         let mut buf = Vec::with_capacity(FEATURE_VECTOR_BYTES);
 
@@ -170,6 +186,10 @@ impl FeatureVector {
             .expect("write proto_gre");
         buf.write_f64::<LittleEndian>(self.proto_esp)
             .expect("write proto_esp");
+        buf.write_f64::<LittleEndian>(self.k_multiplier)
+            .expect("write k_multiplier");
+        buf.write_f64::<LittleEndian>(self.cooldown_counter)
+            .expect("write cooldown_counter");
 
         // Serialize dominant_ip as 16 bytes (IPv6 or IPv6-mapped IPv4 address)
         let ip_v6 = match self.dominant_ip {
@@ -314,6 +334,8 @@ mod tests {
             proto_sctp:  0.05,
             proto_gre:   0.03,
             proto_esp:   0.02,
+            k_multiplier: 1.5,
+            cooldown_counter: 7.0,
             dominant_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 4)),
             victim_ip:   std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 3)),
         }
@@ -324,7 +346,7 @@ mod tests {
     fn serialised_size_is_correct() {
         let bytes = sample_fv().to_bytes();
         assert_eq!(bytes.len(), FEATURE_VECTOR_BYTES);
-        assert_eq!(FEATURE_VECTOR_BYTES, 152);
+        assert_eq!(FEATURE_VECTOR_BYTES, 168);
     }
 
     /// Round-trip: serialise then re-parse with byteorder.
@@ -353,6 +375,8 @@ mod tests {
         let proto_sctp        = cur.read_f64::<LittleEndian>().unwrap();
         let proto_gre         = cur.read_f64::<LittleEndian>().unwrap();
         let proto_esp         = cur.read_f64::<LittleEndian>().unwrap();
+        let k_multiplier      = cur.read_f64::<LittleEndian>().unwrap();
+        let cooldown_counter  = cur.read_f64::<LittleEndian>().unwrap();
 
         let mut ip_bytes = [0u8; 16];
         std::io::Read::read_exact(&mut cur, &mut ip_bytes).unwrap();
@@ -377,6 +401,8 @@ mod tests {
         assert!((proto_sctp        - 0.05            ).abs() < 1e-9);
         assert!((proto_gre         - 0.03            ).abs() < 1e-9);
         assert!((proto_esp         - 0.02            ).abs() < 1e-9);
+        assert!((k_multiplier     - 1.5              ).abs() < 1e-9);
+        assert!((cooldown_counter - 7.0              ).abs() < 1e-9);
         assert_eq!(dominant_ip, std::net::IpAddr::V6(std::net::Ipv4Addr::new(192, 168, 1, 4).to_ipv6_mapped()));
         assert_eq!(victim_ip, std::net::IpAddr::V6(std::net::Ipv4Addr::new(10, 0, 0, 3).to_ipv6_mapped()));
     }

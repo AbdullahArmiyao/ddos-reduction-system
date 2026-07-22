@@ -431,6 +431,8 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 proto_sctp,
                 proto_gre,
                 proto_esp,
+                k_multiplier: cfg.k, // no cooldown/entropy scaling applies during warm-up
+                cooldown_counter: target_state.cooldown_counter as f64,
                 dominant_ip: IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), // No dominant IP during warmup
                 victim_ip:   meta.dst_ip,
             };
@@ -594,6 +596,8 @@ pub fn run_analysis_thread(cfg: AnalysisConfig, rx: Receiver<PacketMeta>) {
                 proto_sctp,
                 proto_gre,
                 proto_esp,
+                k_multiplier: base_k,
+                cooldown_counter: target_state.cooldown_counter as f64,
                 dominant_ip,
                 victim_ip:   meta.dst_ip,
             };
